@@ -1,0 +1,9 @@
+# Local cluster: 1 control-plane + 2 workers that play the role of GPU nodes.
+# `make kind-up` labels the workers with a GPU type; Milestone 2 adds a fake
+# extended resource (gpu.example.com/gpu) so the scheduler has capacity to place.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

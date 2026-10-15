@@ -1,0 +1,16 @@
+# build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# local env
+.env
+*.local.yaml
+kubeconfig*
