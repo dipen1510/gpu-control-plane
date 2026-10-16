@@ -28,6 +28,16 @@ type Store interface {
 	Get(ctx context.Context, tenantID, id string) (store.Instance, error)
 }
 
+// Lifecycle moves an instance on after the API has committed it. In M1 it is
+// *lifecycle.Driver, which walks a new instance to RUNNING within the request
+// (ADR-0001 Amendment 1); the M2 controller replaces it.
+type Lifecycle interface {
+	// AfterCreate is called once per fresh create, with the instance's id
+	// and its resource_version at the create commit. It logs its own
+	// errors; the instance stays in its last committed state.
+	AfterCreate(ctx context.Context, id string, rv int64) (store.Instance, error)
+}
+
 const (
 	headerTenant         = "X-Tenant-ID"
 	headerIdempotencyKey = "Idempotency-Key"
@@ -49,6 +59,11 @@ const (
 	// requestTimeout bounds the database work of one request, so a slow or
 	// stuck Postgres fails the request instead of piling up goroutines.
 	requestTimeout = 10 * time.Second
+
+	// lifecycleTimeout bounds the M1 lifecycle walk after a create (two
+	// small transactions). It runs after requestTimeout's work, and the two
+	// together stay under the server's 15s WriteTimeout (cmd/apiserver).
+	lifecycleTimeout = 3 * time.Second
 )
 
 // Error codes in the {"error": {"code", "message"}} envelope.
@@ -78,14 +93,16 @@ var (
 
 // Handler serves the /v1 instance API.
 type Handler struct {
-	store Store
-	log   *slog.Logger
-	mux   *http.ServeMux
+	store     Store
+	lifecycle Lifecycle
+	log       *slog.Logger
+	mux       *http.ServeMux
 }
 
-// NewHandler returns the API's HTTP handler.
-func NewHandler(s Store, log *slog.Logger) *Handler {
-	h := &Handler{store: s, log: log, mux: http.NewServeMux()}
+// NewHandler returns the API's HTTP handler. lc is run after every fresh
+// create, before the response is written.
+func NewHandler(s Store, lc Lifecycle, log *slog.Logger) *Handler {
+	h := &Handler{store: s, lifecycle: lc, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/instances", h.create)
 	h.mux.HandleFunc("GET /v1/instances/{id}", h.get)
 	return h
@@ -193,6 +210,21 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Info("instance created", "instance_id", res.ID, "tenant", tenant, "node_id", res.NodeID,
 		"state", res.State, "resource_version", res.ResourceVersion, "result", "scheduled")
+
+	// The create is committed; now walk the new instance on (M1: to
+	// RUNNING), before responding so a GET right after sees the result.
+	// The walk is detached from client cancellation: a client hanging up
+	// must not leave the instance half-walked. Replays never get here, so
+	// a retried create can't run the walk twice.
+	lcCtx, lcCancel := context.WithTimeout(context.WithoutCancel(r.Context()), lifecycleTimeout)
+	defer lcCancel()
+	// The driver has logged any error, and the instance stays in its last
+	// committed state; the create itself succeeded, so the client still
+	// gets 202.
+	_, _ = h.lifecycle.AfterCreate(lcCtx, res.ID, res.ResourceVersion)
+
+	// The response is the state the create transaction committed
+	// (SCHEDULED, rv 1), as it will be in M2 (ADR-0001 Amendment 1).
 	writeInstance(w, http.StatusAccepted, res.Instance)
 }
 

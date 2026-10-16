@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dipen1510/gpu-control-plane/internal/api"
+	"github.com/dipen1510/gpu-control-plane/internal/lifecycle"
 	"github.com/dipen1510/gpu-control-plane/internal/migrate"
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
@@ -67,14 +68,18 @@ func run(log *slog.Logger, addr string) error {
 
 	// No reserve-conflict counter until metrics land (S1-13).
 	st := store.New(pool, scheduler.New(nil))
+	// M1 only: walks each new instance to RUNNING (ADR-0001 Amendment 1);
+	// replaced by the controller in M2.
+	driver := lifecycle.New(st, log)
 	// Timeouts bound how long one connection can hold a goroutine, so a slow
 	// or idle client can neither exhaust the server nor stall shutdown:
 	//   ReadHeaderTimeout 5s: headers are a few hundred bytes.
 	//   ReadTimeout 10s: headers plus the whole body (≤4 KB); a client
 	//     trickling the body (slowloris) is cut off here.
 	//   WriteTimeout 15s: longer than the handler's 10s database budget
-	//     (api.requestTimeout) so a slow-but-successful request still gets
-	//     its response.
+	//     (api.requestTimeout) plus the 3s lifecycle walk after a create
+	//     (api.lifecycleTimeout), so a slow-but-successful request still
+	//     gets its response.
 	//   IdleTimeout 60s: keep-alive connections are reused for polling GETs
 	//     but not held forever.
 	// Shutdown closes idle connections at once, and an active one is bounded
@@ -82,7 +87,7 @@ func run(log *slog.Logger, addr string) error {
 	// cannot keep Shutdown waiting past its deadline.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewHandler(st, log),
+		Handler:           api.NewHandler(st, driver, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,

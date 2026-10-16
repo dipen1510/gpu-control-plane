@@ -77,7 +77,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Proposed |
-| S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Proposed |
+| S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
 the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
@@ -298,6 +298,11 @@ Out of scope: provisioning timeout and Pods (M2); HTTP exposure beyond DELETE (S
 
 ### S1-10 (1 pt) — DELETE ends at TERMINATED and releases capacity
 Owner: implementer        Reviewer: verifier        Status: Proposed
+Notes from S1-14 review (must handle): Delete always tries →TERMINATING first, so resuming an
+instance left in TERMINATING needs the caller to pass the current state (e.g. Delete(ctx, id, from,
+rv)) and skip done steps; TERMINATED/FAILED → 202 without calling the driver. A step-2 error means
+TERMINATING was committed — must not become 409, and the no-If-Match retry must re-read and resume,
+not restart. Add Delete to the api.Lifecycle interface (keep the handler swappable for M2).
 Why: users must be able to stop paying and get their quota back; a stale client must not override a newer state (invariant 4)
 Design link: ADR-0001 §API (M1), Q1 (resolved), Amendment 1; Discussion D17
 Depends on: S1-9, S1-14
@@ -373,7 +378,7 @@ Acceptance:
 Out of scope: OpenTelemetry traces, dashboards, alert rules (M4)
 
 ### S1-14 (1 pt) — M1 instant lifecycle driver
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
 Why: without it nothing reaches TERMINATED in M1, so DELETE never gives back GPUs or quota (invariant 5)
 Design link: ADR-0001 Amendment 1; Discussion D17, D12
 Depends on: S1-9

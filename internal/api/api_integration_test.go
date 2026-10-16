@@ -9,12 +9,15 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/dipen1510/gpu-control-plane/internal/lifecycle"
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/seed"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
@@ -22,8 +25,16 @@ import (
 )
 
 // newServer returns an API server backed by a fresh database with 4 seeded
-// nodes (2 H100, 2 A100, 8 GPUs each).
+// nodes (2 H100, 2 A100, 8 GPUs each), running the M1 lifecycle driver.
 func newServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
+	t.Helper()
+	srv, db, _ := newServerWithDriver(t)
+	return srv, db
+}
+
+// newServerWithDriver is newServer that also returns the driver, so tests
+// can run the delete walk directly (HTTP DELETE is S1-10).
+func newServerWithDriver(t *testing.T) (*httptest.Server, *pgxpool.Pool, *lifecycle.Driver) {
 	t.Helper()
 	db := testutil.NewDB(t)
 	nodes, err := seed.Nodes(4)
@@ -33,10 +44,12 @@ func newServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 	if err := seed.Upsert(t.Context(), db, nodes); err != nil {
 		t.Fatalf("seed nodes: %v", err)
 	}
-	h := NewHandler(store.New(db, scheduler.New(nil)), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	srv := httptest.NewServer(h)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st := store.New(db, scheduler.New(nil))
+	driver := lifecycle.New(st, log)
+	srv := httptest.NewServer(NewHandler(st, driver, log))
 	t.Cleanup(srv.Close)
-	return srv, db
+	return srv, db, driver
 }
 
 func do(t *testing.T, method, url string, headers map[string]string, body string) (*http.Response, []byte) {
@@ -115,13 +128,16 @@ func TestCreateHappyPath(t *testing.T) {
 		(SELECT count(*) FROM outbox WHERE aggregate_id = $1)`, got.ID).Scan(&instances, &events, &instanceEvents); err != nil {
 		t.Fatalf("count rows: %v", err)
 	}
-	// Create commits exactly one event, of type instance.scheduled.
-	// NOTE(S1-14): once the lifecycle driver runs after create, this
-	// instance also gets instance.provisioning and instance.running rows;
-	// that story must update the total to the full expected history.
-	if instances != 1 || events != 1 || instanceEvents != 1 {
-		t.Errorf("instances = %d, instance.scheduled events = %d, events for %s = %d; want 1, 1, 1",
+	// Create commits exactly one event, of type instance.scheduled; the M1
+	// lifecycle driver then adds one per step, instance.provisioning and
+	// instance.running (ADR-0001 Amendment 1), so 3 in all.
+	if instances != 1 || events != 1 || instanceEvents != 3 {
+		t.Errorf("instances = %d, instance.scheduled events = %d, events for %s = %d; want 1, 1, 3",
 			instances, events, got.ID, instanceEvents)
+	}
+	if types := outboxTypes(t, db, got.ID); !slices.Equal(types,
+		[]string{"instance.scheduled", "instance.provisioning", "instance.running"}) {
+		t.Errorf("events for %s = %v, want scheduled, provisioning, running", got.ID, types)
 	}
 
 	var ev struct {
@@ -149,6 +165,7 @@ func TestCreateHappyPath(t *testing.T) {
 		t.Fatalf("read accounting: %v", err)
 	}
 	// Seeded nodes start at allocated 0 and the tenant has no quota row.
+	// The instance is RUNNING now and still holds its GPUs.
 	if nodeAlloc != 4 || totalAlloc != 4 || used != 4 {
 		t.Errorf("allocated on %s = %d, total allocated = %d, used = %d; want 4, 4, 4",
 			got.NodeID, nodeAlloc, totalAlloc, used)
@@ -197,7 +214,7 @@ func TestGetConditional(t *testing.T) {
 	// The instance changes (as a lifecycle step would): the old ETag no
 	// longer matches, and the client gets the new state and ETag.
 	if _, err := db.Exec(t.Context(), `UPDATE instances
-		SET state = 'PROVISIONING', resource_version = resource_version + 1 WHERE id = $1`, created.ID); err != nil {
+		SET state = 'TERMINATING', resource_version = resource_version + 1 WHERE id = $1`, created.ID); err != nil {
 		t.Fatalf("advance instance: %v", err)
 	}
 	resp, b = do(t, http.MethodGet, url, map[string]string{headerTenant: "t1", "If-None-Match": etag}, "")
@@ -467,39 +484,126 @@ func TestIdempotentReplay(t *testing.T) {
 	if got := resp.Header.Get(headerReplayed); got != "true" {
 		t.Errorf("replay %s = %q, want %q", headerReplayed, got, "true")
 	}
-	if again != first {
-		t.Errorf("replay body = %+v, want the first create's %+v", again, first)
+	// A replay reports the instance as it is now: the first create answered
+	// with its commit (SCHEDULED rv 1), and the lifecycle driver has since
+	// moved it to RUNNING rv 3.
+	if first.State != "SCHEDULED" || first.ResourceVersion != 1 {
+		t.Errorf("first create body = %+v, want SCHEDULED rv 1", first)
+	}
+	if stored := storedInstance(t, db, first.ID); again != stored || again.State != "RUNNING" ||
+		again.ResourceVersion != 3 {
+		t.Errorf("replay body = %+v, want current %+v (RUNNING rv 3)", again, stored)
+	}
+	if etag := resp.Header.Get("ETag"); etag != `"3"` {
+		t.Errorf("replay ETag = %q, want %q", etag, `"3"`)
 	}
 
-	// Nothing new: 1 instance, 1 event (no lifecycle rerun), 1 key, quota
-	// and GPUs counted once.
+	// Nothing new: the replay wrote no instance, no outbox row (the
+	// lifecycle did not run again), no key, and counted quota and GPUs
+	// once. The first create's 3 events are all there is.
 	after := readWrites(t, db)
 	assertNothingWritten(t, before, after)
-	var scheduled int
-	if err := db.QueryRow(t.Context(),
-		`SELECT count(*) FROM outbox WHERE event_type = 'instance.scheduled'`).Scan(&scheduled); err != nil {
-		t.Fatalf("count events: %v", err)
-	}
-	if after.instances != 1 || scheduled != 1 || after.keys != 1 || after.used["t1/H100"] != 4 {
-		t.Errorf("instances %d, instance.scheduled %d, keys %d, used %d; want 1, 1, 1, 4",
-			after.instances, scheduled, after.keys, after.used["t1/H100"])
+	if after.instances != 1 || after.events != 3 || after.keys != 1 || after.used["t1/H100"] != 4 {
+		t.Errorf("instances %d, outbox %d, keys %d, used %d; want 1, 3, 1, 4",
+			after.instances, after.events, after.keys, after.used["t1/H100"])
 	}
 
-	// A replay reports the instance's current state, not the state at create.
+	// The instance moves on again (as a delete would): a later replay
+	// reports that state, still writing nothing.
 	if _, err := db.Exec(t.Context(), `UPDATE instances
-		SET state = 'RUNNING', resource_version = 3 WHERE id = $1`, first.ID); err != nil {
+		SET state = 'TERMINATING', resource_version = 4 WHERE id = $1`, first.ID); err != nil {
 		t.Fatalf("advance instance: %v", err)
 	}
+	before = readWrites(t, db)
 	resp, later := postInstance(t, srv, "t1", "k1", body)
 	if resp.StatusCode != http.StatusAccepted || resp.Header.Get(headerReplayed) != "true" {
 		t.Fatalf("second replay: status %d %s %q, want 202 true", resp.StatusCode,
 			headerReplayed, resp.Header.Get(headerReplayed))
 	}
-	if stored := storedInstance(t, db, first.ID); later != stored || later.State != "RUNNING" {
-		t.Errorf("second replay body = %+v, want current %+v (RUNNING)", later, stored)
+	if stored := storedInstance(t, db, first.ID); later != stored || later.State != "TERMINATING" {
+		t.Errorf("second replay body = %+v, want current %+v (TERMINATING)", later, stored)
+	}
+	if etag := resp.Header.Get("ETag"); etag != `"4"` {
+		t.Errorf("second replay ETag = %q, want %q", etag, `"4"`)
+	}
+	assertNothingWritten(t, before, readWrites(t, db))
+}
+
+// outboxTypes returns the event types written for instance id, in order.
+func outboxTypes(t *testing.T, db *pgxpool.Pool, id string) []string {
+	t.Helper()
+	rows, err := db.Query(t.Context(), `SELECT event_type FROM outbox WHERE aggregate_id = $1 ORDER BY id`, id)
+	if err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	types, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	return types
+}
+
+// TestCreateThenGetIsRunning: the create answers with the state its own
+// transaction committed, and the M1 lifecycle driver has walked the
+// instance to RUNNING before that answer is sent (ADR-0001 Amendment 1).
+func TestCreateThenGetIsRunning(t *testing.T) {
+	srv, db := newServer(t)
+	created := createInstance(t, srv, "t1", "k1", `{"gpu_type":"H100","gpu_count":2}`)
+	if created.State != "SCHEDULED" || created.ResourceVersion != 1 {
+		t.Errorf("create body = %+v, want SCHEDULED rv 1", created)
+	}
+
+	resp, b := do(t, http.MethodGet, srv.URL+"/v1/instances/"+created.ID, map[string]string{headerTenant: "t1"}, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET: status %d body %s, want 200", resp.StatusCode, b)
+	}
+	var got instanceResponse
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("decode body %s: %v", b, err)
+	}
+	want := created
+	want.State, want.ResourceVersion = "RUNNING", 3
+	if got != want {
+		t.Errorf("GET right after create = %+v, want %+v", got, want)
 	}
 	if etag := resp.Header.Get("ETag"); etag != `"3"` {
-		t.Errorf("second replay ETag = %q, want %q", etag, `"3"`)
+		t.Errorf("ETag = %q, want %q", etag, `"3"`)
+	}
+	if stored := storedInstance(t, db, created.ID); stored != want {
+		t.Errorf("stored = %+v, want %+v", stored, want)
+	}
+}
+
+// TestDriverOutboxOnePerStep: a create over HTTP and a delete walk give
+// exactly one outbox row per committed state, in order, with the state and
+// version of each step in its payload (invariant 3).
+func TestDriverOutboxOnePerStep(t *testing.T) {
+	srv, db, driver := newServerWithDriver(t)
+	created := createInstance(t, srv, "t1", "k1", `{"gpu_type":"A100","gpu_count":4}`)
+	if _, err := driver.Delete(t.Context(), created.ID, 3); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	rows, err := db.Query(t.Context(), `SELECT event_type, aggregate_id, payload->>'state',
+		(payload->>'resource_version')::int FROM outbox ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	type event struct {
+		Type, Aggregate, State string
+		RV                     int
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[event])
+	if err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	var want []event
+	for i, state := range []string{"SCHEDULED", "PROVISIONING", "RUNNING", "TERMINATING", "TERMINATED"} {
+		want = append(want, event{Type: "instance." + strings.ToLower(state), Aggregate: created.ID,
+			State: state, RV: i + 1})
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("outbox =\n  %+v\nwant\n  %+v", got, want)
 	}
 }
 

@@ -51,8 +51,28 @@ func (f *fakeStore) Get(context.Context, string, string) (store.Instance, error)
 	return f.getInst, f.getErr
 }
 
+// lifecycleCall is one AfterCreate call as the fake saw it.
+type lifecycleCall struct {
+	id          string
+	rv          int64
+	ctxErr      error // ctx.Err() when called
+	hasDeadline bool
+}
+
+// fakeLifecycle records AfterCreate calls and returns err.
+type fakeLifecycle struct {
+	calls []lifecycleCall
+	err   error
+}
+
+func (f *fakeLifecycle) AfterCreate(ctx context.Context, id string, rv int64) (store.Instance, error) {
+	_, hasDeadline := ctx.Deadline()
+	f.calls = append(f.calls, lifecycleCall{id: id, rv: rv, ctxErr: ctx.Err(), hasDeadline: hasDeadline})
+	return store.Instance{}, f.err
+}
+
 func newTestHandler(s Store) *Handler {
-	return NewHandler(s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewHandler(s, &fakeLifecycle{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func decodeError(t *testing.T, rec *httptest.ResponseRecorder) errorDetail {
@@ -172,6 +192,82 @@ func TestCreateResponse(t *testing.T) {
 	}
 	if len(call.RequestHash) != sha256.Size {
 		t.Errorf("request hash is %d bytes, want %d", len(call.RequestHash), sha256.Size)
+	}
+}
+
+// TestCreateRunsLifecycle: a fresh create runs the lifecycle once, after the
+// store commits, with the committed id and version, on a context that the
+// client hanging up does not cancel but that has a deadline. The response is
+// still the state the create committed, even if the walk fails.
+func TestCreateRunsLifecycle(t *testing.T) {
+	for _, lcErr := range []error{nil, errors.New("injected lifecycle failure")} {
+		t.Run(fmt.Sprintf("lifecycle err %v", lcErr), func(t *testing.T) {
+			fs := &fakeStore{}
+			lc := &fakeLifecycle{err: lcErr}
+			h := NewHandler(fs, lc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			// The client is already gone when the walk starts.
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			req := newCreateRequest(strings.NewReader(`{"gpu_type":"H100","gpu_count":2}`)).WithContext(ctx)
+			// The store fake ignores ctx, so the create itself still "commits".
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202 (body %s)", rec.Code, rec.Body.String())
+			}
+			if len(lc.calls) != 1 {
+				t.Fatalf("AfterCreate called %d times, want 1", len(lc.calls))
+			}
+			call := lc.calls[0]
+			if call.id != fs.createCalls[0].ID || call.rv != 1 {
+				t.Errorf("AfterCreate(%s, %d), want (%s, 1)", call.id, call.rv, fs.createCalls[0].ID)
+			}
+			if call.ctxErr != nil || !call.hasDeadline {
+				t.Errorf("AfterCreate ctx err %v, deadline %v; want not canceled by the client, with a deadline",
+					call.ctxErr, call.hasDeadline)
+			}
+			var got instanceResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if got.State != "SCHEDULED" || got.ResourceVersion != 1 || rec.Header().Get("ETag") != `"1"` {
+				t.Errorf("body %+v ETag %s, want the committed SCHEDULED rv 1", got, rec.Header().Get("ETag"))
+			}
+		})
+	}
+}
+
+// TestCreateLifecycleOnlyOnFreshCreate: a replay, a refused create or a
+// store error never runs the lifecycle.
+func TestCreateLifecycleOnlyOnFreshCreate(t *testing.T) {
+	replayed := store.CreateResult{Replayed: true, Instance: store.Instance{
+		ID: "inst_earlier", State: statemachine.Running, ResourceVersion: 3,
+	}}
+	tests := []struct {
+		name string
+		fs   *fakeStore
+	}{
+		{name: "replay", fs: &fakeStore{createResult: &replayed}},
+		{name: "key reused", fs: &fakeStore{createErr: store.ErrIdempotencyKeyReused}},
+		{name: "quota exceeded", fs: &fakeStore{createErr: store.ErrQuotaExceeded}},
+		{name: "insufficient capacity", fs: &fakeStore{createErr: store.ErrInsufficientCapacity}},
+		{name: "store error", fs: &fakeStore{createErr: errors.New("boom")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lc := &fakeLifecycle{}
+			h := NewHandler(tc.fs, lc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newCreateRequest(strings.NewReader(`{"gpu_type":"H100","gpu_count":2}`)))
+			if len(tc.fs.createCalls) != 1 {
+				t.Fatalf("store.Create called %d times, want 1", len(tc.fs.createCalls))
+			}
+			if len(lc.calls) != 0 {
+				t.Errorf("AfterCreate called %d times (status %d), want 0", len(lc.calls), rec.Code)
+			}
+		})
 	}
 }
 
@@ -460,7 +556,7 @@ func TestCreateBodyErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var logs bytes.Buffer
 			fs := &fakeStore{}
-			h := NewHandler(fs, slog.New(slog.NewTextHandler(&logs, nil)))
+			h := NewHandler(fs, &fakeLifecycle{}, slog.New(slog.NewTextHandler(&logs, nil)))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, newCreateRequest(tc.body))
 
