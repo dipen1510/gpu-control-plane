@@ -25,7 +25,7 @@ order we worked it out.
 | D9 | Database | Postgres 16 + outbox |
 | D10 | Concurrency control | Optimistic concurrency (`resource_version`); DB conditional updates are the final guard |
 | D11 | Source of truth | Postgres = customer state; Kubernetes = execution; idempotent transitions bridge them |
-| D12 | State machine | Unchanged; v1 instances start at SCHEDULED |
+| D12 | Lifecycle | `202 Accepted` at SCHEDULED; controller drives the rest async; boot/shutdown delays simulated in the Pod; provisioning timeout + injected boot failures; billing from RUNNING |
 | D13 | Leader election | Controller only |
 | D14 | Fake GPUs | kind workers + label + extended resource `gpu.example.com/gpu: 8`; instance = Pod |
 | D15 | Node inventory | Rows inserted once via Node sync; placement only updates `allocated`; single owner per column; drift reconciler |
@@ -315,16 +315,69 @@ level-triggered loops** remove the need for a distributed transaction.
 
 ---
 
-## D12 — State machine in v1
+## D12 — State machine and instance lifecycle
 
-**Decision.** Unchanged:
+**Question.** In production an instance doesn't start right away: it is
+initiated, in progress, running, terminating, terminated. Can we model that
+without a queue, e.g. with a delay?
+
+**Discussion — fail fast covers only the capacity decision.** "SCHEDULED"
+does not mean running; it means GPUs are reserved on a node. The API answers
+in milliseconds, and the rest of the lifecycle happens asynchronously in the
+controller while the client polls `GET /v1/instances/{id}`:
+
 ```
-PENDING → SCHEDULED → PROVISIONING → RUNNING → TERMINATING → TERMINATED
-   └──────────┴────────────┴──► FAILED
+POST /v1/instances → 202 Accepted { "state": "SCHEDULED" }
+
+controller (background):
+  SCHEDULED → PROVISIONING → RUNNING            (seconds to minutes)
+DELETE:
+  RUNNING → TERMINATING → TERMINATED            (seconds)
+any of SCHEDULED / PROVISIONING → FAILED        (timeout or boot failure)
 ```
-Because placement happens in the request (D3/D4), v1 instances are created
-directly as **SCHEDULED**. PENDING stays in the model for the v2 queue, so
-nothing is redesigned later.
+
+| Tech lead's term | State | Meaning |
+|---|---|---|
+| initiate | SCHEDULED | Accepted; quota and GPUs reserved on a node |
+| in-progress | PROVISIONING | Controller created the Pod; it is booting |
+| running | RUNNING | Pod ready; **billing starts here** |
+| terminating | TERMINATING | Delete requested; Pod shutting down |
+| terminated | TERMINATED | Pod gone; GPUs and quota released |
+
+The response is **202 Accepted** (not 201) because the work is not finished.
+
+**Discussion — where the delay lives.** Without a delay everything on kind
+reaches RUNNING almost instantly and the in-between states and failure paths
+are never exercised. Two places to put it:
+
+- ❌ `time.Sleep` in the API handler or controller: blocks a request or a
+  worker, the "progress" is lost if the process restarts, and it hides the
+  real problem (waiting on an external system).
+- ✅ **In the Pod (execution layer).** An init container runs
+  `sleep $BOOT_SECONDS` (randomized, e.g. 10–30 s) to stand in for VM boot,
+  image pull and GPU checks; a `preStop` hook sleeps a few seconds so
+  TERMINATING is visible. The controller never sleeps: it reconciles, sees
+  the Pod is not ready, and is woken by Kubernetes when the Pod changes. The
+  delay is stored in the Pod's state, so a controller restart mid-boot loses
+  nothing — level-triggered reconciliation.
+
+**Decision.**
+- Create returns **202 Accepted** with state SCHEDULED; the controller drives
+  all later transitions asynchronously; clients poll.
+- Boot and shutdown delays are simulated **in the Pod** (init container
+  sleep, `preStop` sleep), never with sleeps in our code.
+- **Provisioning timeout** (default 5 min): PROVISIONING too long → FAILED,
+  Pod deleted, GPUs and quota released.
+- **Injected boot failures:** `BOOT_FAIL_RATE` (e.g. 0.1) makes some Pods exit
+  with an error so the FAILED path is exercised; the SRE raises it in chaos
+  tests.
+- **Delete during boot** is allowed (PROVISIONING → TERMINATING) and must be
+  handled cleanly.
+- Billing starts at RUNNING.
+- PENDING stays in the model, unused in v1, for the v2 queue.
+
+**Protects:** invariant 5 (capacity released on every path to a terminal
+state) and invariant 3 (one outbox event per transition).
 
 ---
 

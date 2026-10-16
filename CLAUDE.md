@@ -27,9 +27,14 @@ metering pipeline.
 PENDING → SCHEDULED → PROVISIONING → RUNNING → TERMINATING → TERMINATED
    │           │            │
    └───────────┴────────────┴──► FAILED  (terminal; capacity is released)
+
+also: PROVISIONING → TERMINATING   (user deletes while booting)
 ```
 Rules: transitions only move forward; every transition is a single DB
 transaction that also writes an outbox event; a terminal state never changes.
+v1: create returns 202 at SCHEDULED (PENDING unused until the v2 queue); the
+controller drives later states asynchronously; boot/shutdown delays live in
+the Pod, never in `time.Sleep` in our code. See `docs/Discussion.md` D12.
 
 ## Core invariants (the verifier checks these on every story)
 
