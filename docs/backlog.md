@@ -56,7 +56,7 @@ Summary (details below). Integration tests need `make db-up` first.
 
 | ID | Pts | Story | Owner | Depends on | Status |
 |---|---|---|---|---|---|
-| S1-1 | 1 | State machine rules | implementer | — | Proposed |
+| S1-1 | 1 | State machine rules | implementer | — | Done |
 | S1-2 | 2 | Schema, migrations and test database | implementer | — | Proposed |
 | S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Proposed |
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Proposed |
@@ -76,7 +76,10 @@ the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
 
 ### S1-1 (1 pt) — State machine rules
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Follow-ups from review: S1-9 must release capacity only when `HoldsCapacity(from) && IsTerminal(to)`
+(ADR step 2 says "if to is terminal"; wrong for v2 PENDING→FAILED). Design question for M2:
+no RUNNING→FAILED edge, so a node dying under a RUNNING instance looks like a normal termination.
 Why: one place decides which transitions are legal, so the API and the M2 controller can never disagree
 Design link: ADR-0001 §Lifecycle transitions; CLAUDE.md §Instance state machine
 Depends on: —
