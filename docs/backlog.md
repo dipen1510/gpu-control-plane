@@ -50,6 +50,13 @@ Acceptance:
   - no files changed outside docs/
 Out of scope: CLAUDE.md state-machine note (outside architect's write scope; orchestrator/tech lead)
 
+### A-4 (1 pt) — Record corrections found in review
+Owner: architect        Reviewer: tech lead        Status: Done
+Result: ADR-0001 Amendment 2 (lost-race lock + savepoint; Transition check order and
+lock-then-CAS-then-release; API error codes and header limits; M3 outbox scan rule; invariants 6
+and 7 evidence) and docs/Discussion.md D18 "Lessons from review (concurrency)".
+Open: promote invariants 6 and 7 into CLAUDE.md after S1-11 lands (proposed, not done).
+
 ### Milestone 1 stories (from ADR-0001)
 
 Summary (details below). Integration tests need `make db-up` first.

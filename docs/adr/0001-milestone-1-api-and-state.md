@@ -53,7 +53,9 @@ every state-change transaction; a store-level transition function; metrics.
 - **Row lock + re-check:** when two transactions update the same row,
   Postgres makes the second wait until the first commits, then re-evaluates
   the `WHERE` against the *new* row. That is why `allocated + n <= capacity`
-  stays true even with 100 concurrent writers.
+  stays true even with 100 concurrent writers. *(Losing the re-check still
+  leaves the second transaction holding that row lock until it ends; see
+  Amendment 2.)*
 - **Outbox:** a table we write events into in the same transaction as the
   state change, so a committed change can never lose its event. In M1 rows
   only accumulate; the relay that publishes them arrives in M3.
@@ -88,12 +90,13 @@ every state-change transaction; a store-level transition function; metrics.
 | `tenant_quota` | PK `(tenant_id, gpu_type)`, `quota_limit` (default 16), `used` | `CHECK (used >= 0 AND used <= quota_limit)` |
 | `instances` | `id` PK (`inst_…`), `tenant_id`, `gpu_type`, `gpu_count`, `node_id` FK, `state`, `resource_version`, `failure_reason`, `created_at`, `updated_at` | `CHECK gpu_count IN (1,2,4,8)`; `CHECK state IN (…7 states)`; index on `(tenant_id)` and `(node_id)` |
 | `idempotency_keys` | PK `(tenant_id, key)`, `request_hash`, `instance_id`, `created_at` | PK makes a key usable once per tenant; FK to `instances` is `DEFERRABLE INITIALLY DEFERRED` |
-| `outbox` | `id` bigserial (order), `event_id` uuid UNIQUE, `aggregate_id`, `event_type`, `payload` jsonb, `occurred_at`, `published_at` NULL | partial index `WHERE published_at IS NULL` for the M3 relay |
+| `outbox` | `id` bigserial (order), `event_id` uuid UNIQUE, `aggregate_id`, `event_type`, `payload` jsonb, `occurred_at`, `published_at` NULL | partial index `WHERE published_at IS NULL` for the M3 relay (id order ≠ commit order; see Amendment 2) |
 
 The CHECK constraints are a second guard behind the conditional updates: even
 a buggy query cannot commit an over-allocation. "Holds capacity" means state
 in {SCHEDULED, PROVISIONING, RUNNING, TERMINATING}; capacity and quota are
-released on the transition to TERMINATED or FAILED.
+released on the transition to TERMINATED or FAILED *(only from a state that
+holds capacity; see Amendment 2)*.
 
 ### API (M1)
 
@@ -102,7 +105,7 @@ Errors use one envelope: `{"error": {"code": "...", "message": "..."}}`.
 
 | Request | Success | Errors |
 |---|---|---|
-| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}` (state at commit), `ETag`; in M1 a `GET` right after shows RUNNING (Amendment 1) | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` |
+| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}` (state at commit), `ETag`; in M1 a `GET` right after shows RUNNING (Amendment 1) | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` · also `413` / `408` / header limits (see Amendment 2) |
 | `GET /v1/instances/{id}`, optional `If-None-Match` | `200` instance, `ETag: "<rv>"`; `304` if rv unchanged | `400` (no tenant) · `404 not_found` (also for another tenant's instance — don't leak existence) |
 | `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING; the instance ends TERMINATED with GPUs and quota released (Amendment 1) | `404` · `409 stale_resource_version` · `409 invalid_transition` |
 
@@ -135,7 +138,7 @@ BEGIN  (READ COMMITTED)
      snapshot: SELECT schedulable nodes of gpu_type with free ≥ n (no locks)
      rank: best fit (least free after) → spread tenant across
            failure_domain → random
-     for each candidate:
+     for each candidate:           (each attempt in a savepoint: Amendment 2)
        UPDATE nodes SET allocated = allocated + n
          WHERE id=$c AND schedulable AND allocated + n <= capacity
        1 row → chosen; 0 rows → next candidate
@@ -147,8 +150,9 @@ COMMIT → 202
 
 Lock order everywhere: `idempotency_keys → tenant_quota → nodes → instances
 → outbox`. A transaction holds at most one node lock (losing candidates are
-not locked). Postgres deadlock detection plus a 40P01 → 503 mapping is only the
-backstop.
+not locked). *(Superseded: that is only true because each reserve attempt
+runs in a savepoint; see Amendment 2.)* Postgres deadlock detection plus a
+40P01 → 503 mapping is only the backstop.
 
 ### Lifecycle transitions (store.Transition)
 
@@ -157,6 +161,9 @@ func (s *Store) Transition(ctx context.Context, id string, to statemachine.State
     expectedRV int64, reason string) (Instance, error)
 // ErrNotFound, ErrInvalidTransition, ErrStaleVersion
 ```
+*(Steps 1–3 below are superseded: the error order, the release condition and
+"decrement, then compare-and-set" were all corrected. Use Amendment 2, item 2.)*
+
 1. Read the instance (no lock). `statemachine.CanTransition(cur, to)` or
    `ErrInvalidTransition`.
 2. BEGIN. If `to` is TERMINATED or FAILED: `used -= n` on `tenant_quota`, then
@@ -168,6 +175,8 @@ func (s *Store) Transition(ctx context.Context, id string, to statemachine.State
 
 Retrying a transition that already happened fails at step 3 and changes
 nothing, which is the idempotent behavior the M2 controller relies on (D11).
+*(Still true; the retry now gets `ErrStaleVersion`, usually from the
+version check on the read. See Amendment 2.)*
 
 ## Decisions
 
@@ -227,22 +236,23 @@ against `DATABASE_URL`); `make test` stays dependency-free.
 | 3 No lost events | outbox insert inside every state-change transaction |
 | 4 Optimistic concurrency | `resource_version` in `Transition` and `If-Match` on DELETE |
 | 5 Safe deletion | Capacity and quota released only in the terminal transition's transaction (finalizer comes in M2) |
-| **6 (candidate) Quota under concurrency** | A tenant's GPUs in capacity-holding states never exceed its `quota_limit` per GPU type, even with N replicas — conditional `UPDATE tenant_quota` + CHECK |
-| **7 (candidate) Accounting matches** | `nodes.allocated` = sum of `gpu_count` of capacity-holding instances on that node; `tenant_quota.used` likewise per tenant/type. Checked by tests and a drift metric (D15 backstop) |
+| **6 (candidate) Quota under concurrency** | A tenant's GPUs in capacity-holding states never exceed its `quota_limit` per GPU type, even with N replicas — conditional `UPDATE tenant_quota` + CHECK *(now enforced and tested; see Amendment 2, item 5)* |
+| **7 (candidate) Accounting matches** | `nodes.allocated` = sum of `gpu_count` of capacity-holding instances on that node; `tenant_quota.used` likewise per tenant/type. Checked by tests and a drift metric (D15 backstop) *(see Amendment 2, item 5)* |
 
 ## Failure modes
 
 | Failure | Effect | How we recover / why it's safe |
 |---|---|---|
 | Concurrent creates, same tenant | Both want the same `tenant_quota` row | Row lock serializes them; second re-checks `used + n <= limit` on the new value → one may get 403. Other tenants are not blocked |
-| Concurrent creates racing for the last GPUs on a node | Both pick the same best-fit node from their snapshot | Second waits on the row lock, re-checks, gets 0 rows, tries the next candidate; if none, 503. Never over-allocates |
+| Concurrent creates racing for the last GPUs on a node | Both pick the same best-fit node from their snapshot | Second waits on the row lock, re-checks, gets 0 rows, rolls back to its savepoint (dropping that lock), tries the next candidate; if none, 503. Never over-allocates (Amendment 2) |
 | Duplicate request, same key + body (client retry) | Could double-provision | Step 1 finds the key → replay, no new quota/capacity/event. If the first is still in flight, the second waits for its commit |
 | Same key, different body | Client bug or key reuse | 409 `idempotency_key_reused`; nothing written |
 | Crash mid-transaction (process, network, DB restart) | Partial reservation? | Not possible: the transaction rolls back as a whole. Client sees an error or timeout and retries with the same key |
 | Commit succeeded but response lost | Client thinks it failed | Retry with the same key returns the same instance |
 | Stale `resource_version` (DELETE `If-Match`, or `Transition`) | Would overwrite a newer state | 0 rows → 409 / `ErrStaleVersion`; caller re-reads |
 | Postgres down or slow | Requests fail | 503 with no partial state; per-request statement timeout via ctx; `/readyz` fails so the load balancer stops routing |
-| Two transactions lock rows in opposite order | Deadlock | Fixed lock order prevents it; Postgres detection aborts one as backstop |
+| Two transactions lock rows in opposite order | Deadlock | Fixed lock order prevents it; Postgres detection aborts one as backstop. Lost-race locks count too: savepoints in Place (Amendment 2) |
+| Concurrent identical transitions (retries, N controller replicas) | Double release; `used` below 0 | Lock counters, then compare-and-set; only the winner decrements. Losers get `ErrStaleVersion` (Amendment 2) |
 | Accounting drift from a bug | `allocated` ≠ real usage | Drift gauge alerts (D15: alert, never silently fix) |
 
 ## Observability
@@ -330,3 +340,128 @@ grows. The outbox history is identical in M1 and M2.
 **Protects:** invariant 3 (one outbox row per step), invariant 4 (every step
 carries the rv), invariant 5 (release only in the transaction that reaches
 TERMINATED). Story: S1-14.
+
+## Amendment 2 (2026-10-16): corrections found in review
+
+Verifier reviews of S1-5, S1-7/S1-8 and S1-9 (plus a note from S1-2) found
+places where the accepted text above is wrong or incomplete. The code
+already follows this amendment; this records it. Plain-language lessons
+and timelines are in `docs/Discussion.md` D18. Story: A-4.
+
+### 1. Place: a lost race keeps its row lock (S1-5)
+
+**Was:** "A transaction holds at most one node lock (losing candidates are
+not locked)."
+
+**Wrong because:** under READ COMMITTED, when our `UPDATE nodes … WHERE
+allocated + n <= capacity` has to wait for another transaction's lock on
+that row, Postgres locks the row for us once the other one commits, *then*
+re-checks the `WHERE`. If the re-check fails (0 rows), we **keep the lock**
+until our transaction ends. So Place could end up holding the lost node plus
+the node it finally reserved. Two creates each holding a lost node the other
+wants then deadlock: the verifier saw `40P01` in 5 of 40 runs.
+
+**Now:** each reserve attempt runs in its own savepoint (`internal/scheduler`
+`reserve`):
+
+```
+SAVEPOINT
+UPDATE nodes … WHERE id=$c AND schedulable AND allocated + n <= capacity
+  1 row  → RELEASE SAVEPOINT (keeps the update and its lock) → chosen
+  0 rows → ROLLBACK TO SAVEPOINT (drops the lock it waited for) → next candidate
+```
+
+When Place returns, the transaction holds a lock on the reserved node only.
+Cost: 3 round trips per attempt instead of 1 (watch
+`gpucp_scheduler_place_duration_seconds`, S1-13). Evidence:
+`TestPlaceReleasesLockOnLostRace` (fails 10/10 without the savepoint).
+**Protects:** the lock-order rule, and so availability; invariant 1 is
+unchanged (the conditional UPDATE still decides).
+
+### 2. store.Transition: check order, lock-then-CAS, release condition (S1-9)
+
+Replaces steps 1–3 of §Lifecycle transitions.
+
+**Error order:** `ErrNotFound` → `ErrStaleVersion` (rv mismatch) →
+`ErrInvalidTransition`. The version is checked *before* the state machine,
+so a caller that lost a race always hears "stale, re-read", never a
+misleading "illegal move" computed from a state it never saw. The M1 driver
+and the DELETE retry loop (S1-14, S1-10, not built yet) depend on this. A retry of a step that
+was already applied returns `ErrStaleVersion` and changes nothing, so D11
+(idempotent transitions) still holds.
+
+**Release condition:** release only when `HoldsCapacity(from) &&
+IsTerminal(to)`. "`to` is terminal" alone is wrong: v2's PENDING → FAILED
+never reserved anything and must release nothing
+(`TestTransitionFromPendingDoesNotRelease`).
+
+**Transaction order:**
+
+```
+read instance (no lock): not found? rv ≠ expected? edge illegal?   → errors above
+BEGIN
+  if release: SELECT … FROM tenant_quota … FOR UPDATE    (lock order unchanged:
+              SELECT … FROM nodes … FOR UPDATE            quota → nodes → instances → outbox)
+  UPDATE instances SET state=$to, rv=rv+1
+    WHERE id=$1 AND state=$from AND rv=$expected RETURNING *
+    0 rows → ROLLBACK → ErrStaleVersion        (nothing was decremented)
+  if release: used -= n; allocated -= n        (only the winner gets here)
+  INSERT outbox instance.<state>
+COMMIT
+```
+
+The rows to lock come from the unlocked read; that is safe because
+`tenant_id`, `gpu_type`, `gpu_count` and `node_id` never change while an
+instance holds capacity, and the code refuses to release if the row returned
+by the UPDATE differs from what it locked.
+
+**Why the old order failed:** it decremented first, then did the CAS. A
+loser waiting on the quota row lock resumed after the winner committed and
+subtracted from a row that was already released, so `used` went below 0 and
+the CHECK constraint aborted it with `23514` instead of `ErrStaleVersion`.
+The CHECK prevented a double release, but the caller got the wrong error.
+Evidence: `TestTransitionConcurrentRepeatReleasesOnce` (100 racers, exactly
+1 winner, 1 outbox row, released once), `TestCreateTransitionChurnNoDeadlock`
+(fails on any `40P01`; totals back to 0).
+**Protects:** invariants 4 and 5, and 7.
+
+### 3. API errors (S1-7, S1-8)
+
+Adds to §API (M1):
+
+| Case | Response |
+|---|---|
+| Create body larger than 4 KiB | `413 request_too_large` |
+| Server read deadline hit while reading the body | `408 request_timeout` |
+| Malformed JSON, unknown field, trailing data | `400 invalid_request`, fixed message `malformed JSON body` |
+| `X-Tenant-ID` longer than 64, `Idempotency-Key` longer than 255, or either one not visible ASCII (0x21–0x7E, so no spaces) | `400 invalid_request`. The header value is never echoed back |
+| Same key, different body | `409 idempotency_key_reused` |
+| Same key, same body | `202`, original instance in its current state, header `Idempotent-Replayed: true` |
+| Any unexpected error | `500 internal`, message `internal error` |
+
+Rule: messages are fixed or built only from validated fields. The underlying
+error (decoder output can contain socket addresses; database errors contain
+SQL details) is logged and never returned. Header limits exist because both
+values go into primary keys, and an oversized btree entry would be a 500,
+not a 400.
+
+### 4. M3 note: outbox order (S1-2)
+
+`outbox.id` comes from a sequence, which is assigned at INSERT time, not at
+COMMIT. Transaction A can take id 10, B take id 11, and B commit first. A
+relay that remembers "last id seen = 11" would skip 10 forever (a lost
+event, breaking invariant 3). The M3 relay must scan
+`WHERE published_at IS NULL` (the partial index exists for this) and mark
+rows published; never use a "last id seen" cursor. Consumers still dedupe
+by `event_id`.
+
+### 5. Invariants 6 and 7: from candidate to enforced
+
+| Invariant | Enforced by | Tested by (today) | Still missing |
+|---|---|---|---|
+| 6 Quota under concurrency | Conditional `UPDATE tenant_quota … used + n <= quota_limit` + CHECK | `TestCreateQuotaExceeded` (fails if the quota `WHERE` is dropped), `TestQuotaIsPerGPUType`, `TestSchemaRejectsOverQuota`, churn test (S1-6, S1-7, S1-9) | A many-requests-one-tenant race at the limit (S1-11) |
+| 7 Accounting matches | Reserve and release happen in the same transaction as the state change; release only for the CAS winner | `TestTransitionFullLifecycle`, `TestTransitionConcurrentRepeatReleasesOnce`, `TestCreateTransitionChurnNoDeadlock` (totals return to their start) (S1-9) | Direct `allocated = SUM(gpu_count)` check (S1-11) and the drift gauge (S1-13) |
+
+**Proposal (tech lead to decide):** promote 6 and 7 into the invariant list
+in `CLAUDE.md`, so the verifier checks them on every story. This ADR does
+not edit `CLAUDE.md`.

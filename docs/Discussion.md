@@ -1,7 +1,7 @@
 # Design discussion — v1
 
 Record of the design discussion between the tech lead and the architect
-(2026-10-15; D17 added 2026-10-16) that produced the v1 decisions. For each decision: the question
+(2026-10-15; D17 and D18 added 2026-10-16) that produced the v1 decisions. For each decision: the question
 that started it, the options we weighed, what we chose and why, and which
 invariant from `CLAUDE.md` it protects.
 
@@ -31,6 +31,7 @@ order we worked it out.
 | D15 | Node inventory | Rows inserted once via Node sync; placement only updates `allocated`; single owner per column; drift reconciler |
 | D16 | Client notifications | Clients poll `GET` with `If-None-Match` (304 when unchanged); push (webhook / SSE / watch) deferred to M3+ on the outbox and event bus |
 | D17 | M1 lifecycle driver | M1 only: an instant driver in the apiserver walks the legal path via `store.Transition` (create → RUNNING, DELETE → TERMINATED); state machine unchanged; replaced by the M2 controller |
+| D18 | Lessons from review (concurrency) | A lost `UPDATE` race keeps its row lock → one savepoint per reserve attempt; lock, then compare-and-set, then decrement (only the winner releases) |
 
 ---
 
@@ -548,6 +549,112 @@ the loop before the M2 controller exists?
 **Protects:** invariant 3 (every step is its own transaction with exactly one
 outbox row) and invariant 5 (capacity and quota released only in the
 transaction that reaches TERMINATED).
+
+---
+
+## D18 — Lessons from review (concurrency)
+
+**Question.** (2026-10-16) The verifier found two bugs that the ADR's own
+text would have produced (S1-5, S1-9). Both are about what Postgres does
+while one transaction *waits* for another. What should we remember?
+
+Background for both: under READ COMMITTED, if your `UPDATE` hits a row that
+another transaction has locked, you wait. When the other commits, Postgres
+locks the row for you and re-checks your `WHERE` against the new values.
+Formal record: ADR-0001 Amendment 2.
+
+### Lesson 1 — Losing a race still leaves you holding the lock
+
+We assumed "0 rows updated" means "we touched nothing". Wrong: if the
+`UPDATE` had to wait, the row is now locked by us even though the re-check
+failed, and it stays locked until our transaction ends.
+
+```
+ n1 and n2 each have 2 free GPUs. C1 and C2 are other creates that have just
+ taken them (not committed yet). A ranks n1 first; B ranks n2 first
+ (random tie-break).
+
+ time  create A                     create B
+  1    UPDATE n1 … waits for C1     UPDATE n2 … waits for C2
+  2    C1 commits: re-check fails   C2 commits: re-check fails
+       0 rows, but A HOLDS n1       0 rows, but B HOLDS n2
+  3    try n2 … waits for B         try n1 … waits for A
+       → each waits for the other: deadlock (40P01), one is aborted
+```
+
+Neither A nor B could even have succeeded; they deadlock on nodes they had
+already lost. The verifier saw it in 5 of 40 runs.
+
+**Fix.** Wrap each attempt in a savepoint (a "bookmark" inside the
+transaction). On 0 rows, `ROLLBACK TO SAVEPOINT` undoes everything since the
+bookmark, *including the lock*. Place now holds at most one node lock, as
+the design always intended.
+
+**Takeaway.** A lock taken by a failed statement is still a lock. When a
+transaction tries several rows in turn, release the losers explicitly
+(savepoint), or lock in a global order, or take no locks (pure snapshot).
+
+### Lesson 2 — Check (compare-and-set) first, then decrement
+
+The ADR said: decrement `used` and `allocated`, then do the compare-and-set
+on the instance; if it fails, roll back. That looks safe ("rollback undoes
+it"), but the decrement *waits* on a lock, and by the time it runs the world
+has changed.
+
+```
+ tenant has 2 GPUs used, both on this instance; A and B both read
+ "TERMINATING rv 5" and try → TERMINATED
+
+ time  A                                   B
+  1    UPDATE quota SET used = used - 2
+       (used 2 → 0, row locked)
+  2                                        UPDATE quota SET used = used - 2
+                                           … waits for A
+  3    CAS on instance (rv 5 → 6): wins
+  4    COMMIT
+  5                                        re-check: used is 0 → 0 - 2 = -2
+                                           CHECK (used >= 0) fails: 23514
+```
+
+B should have been told "stale, re-read" (`ErrStaleVersion`). Instead it got
+a constraint error. The CHECK stopped a double release, so no data was
+wrong. But the caller got the wrong error, and a controller would treat it
+as a real failure.
+
+**Fix.** Lock the counters first (`SELECT … FOR UPDATE`, same lock order as
+create), then do the compare-and-set, and decrement only if it matched:
+
+```
+ time  A                                   B
+  1    lock quota, lock node
+  2                                        lock quota … waits for A
+  3    CAS wins → used -= 2, allocated -= 2
+  4    COMMIT
+  5                                        gets lock; CAS sees rv 6 → 0 rows
+                                           ROLLBACK → ErrStaleVersion
+```
+
+Two related fixes from the same review: the version is checked *before*
+asking the state machine "is this edge legal?", so a loser always hears
+"stale" and never "illegal move"; and the release happens only when leaving
+a state that holds capacity (`PENDING → FAILED` releases nothing).
+
+**Takeaway.** "Decide, then act" must be in the same order inside the
+transaction as in your head: prove you won (compare-and-set) before you
+change anything that depends on winning. Constraints are the backstop, not
+the control flow.
+
+**Interview one-liners.**
+- "In Postgres a waiting UPDATE that loses its re-check keeps the row lock;
+  use a savepoint per attempt to release it."
+- "Lock, then CAS, then mutate. Mutating before the CAS makes the loser act
+  on a state it never saw."
+- "Check the version before the business rule, so a loser gets a retryable
+  error instead of a misleading one."
+
+**Protects:** invariant 1 (no over-allocation; the conditional UPDATE still
+decides), invariant 4 (losers get `ErrStaleVersion`), invariant 5 (released
+exactly once), and the candidate invariant 7 (accounting matches).
 
 ---
 
