@@ -35,6 +35,9 @@ transaction that also writes an outbox event; a terminal state never changes.
 v1: create returns 202 at SCHEDULED (PENDING unused until the v2 queue); the
 controller drives later states asynchronously; boot/shutdown delays live in
 the Pod, never in `time.Sleep` in our code. See `docs/Discussion.md` D12.
+M1 only: an instant lifecycle driver in the apiserver walks SCHEDULED→PROVISIONING→RUNNING
+after create and →TERMINATING→TERMINATED on DELETE via store.Transition (D17); replaced by
+the controller in M2.
 
 ## Core invariants (the verifier checks these on every story)
 

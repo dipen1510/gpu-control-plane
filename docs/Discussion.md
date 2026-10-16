@@ -1,7 +1,7 @@
 # Design discussion — v1
 
 Record of the design discussion between the tech lead and the architect
-(2026-10-15) that produced the v1 decisions. For each decision: the question
+(2026-10-15; D17 added 2026-10-16) that produced the v1 decisions. For each decision: the question
 that started it, the options we weighed, what we chose and why, and which
 invariant from `CLAUDE.md` it protects.
 
@@ -30,6 +30,7 @@ order we worked it out.
 | D14 | Fake GPUs | kind workers + label + extended resource `gpu.example.com/gpu: 8`; instance = Pod |
 | D15 | Node inventory | Rows inserted once via Node sync; placement only updates `allocated`; single owner per column; drift reconciler |
 | D16 | Client notifications | Clients poll `GET` with `If-None-Match` (304 when unchanged); push (webhook / SSE / watch) deferred to M3+ on the outbox and event bus |
+| D17 | M1 lifecycle driver | M1 only: an instant driver in the apiserver walks the legal path via `store.Transition` (create → RUNNING, DELETE → TERMINATED); state machine unchanged; replaced by the M2 controller |
 
 ---
 
@@ -377,6 +378,11 @@ are never exercised. Two places to put it:
 - Billing starts at RUNNING.
 - PENDING stays in the model, unused in v1, for the v2 queue.
 
+**M1 note.** The controller arrives in M2. Until then an *instant lifecycle
+driver* in the apiserver walks the same states with no delays (D17); boot and
+shutdown delays, the provisioning timeout and injected failures start with
+the controller.
+
 **Protects:** invariant 5 (capacity released on every path to a terminal
 state) and invariant 3 (one outbox event per transition).
 
@@ -498,6 +504,50 @@ controller stays in M2). Clients poll `GET /v1/instances/{id}` with
 `If-None-Match`. Push notifications (webhook or SSE/watch) are deferred to M3+
 and will be built from the outbox and event bus, never as a second source of
 truth.
+
+---
+
+## D17 — M1 instant lifecycle driver
+
+**Question.** (2026-10-16) In M1 nothing moves an instance past SCHEDULED, so
+`DELETE` stops at TERMINATING and never releases GPUs or quota over HTTP. A
+tenant who creates and deletes 16 GPUs is locked out for good. How do we close
+the loop before the M2 controller exists?
+
+**Options.**
+- **A. Shortcut edges** — add edges such as `SCHEDULED → RUNNING` and
+  `RUNNING → TERMINATED` (skipping TERMINATING) so the API jumps straight there.
+  Smallest code, but M2 would have to *remove* edges (a breaking change to the
+  state machine), and the outbox history would differ between M1 and M2
+  (metering in M3 would see `scheduled → running` in old data and
+  `scheduled → provisioning → running` in new data).
+- **B. Instant driver** — a small component in the apiserver walks the
+  *legal* path immediately, one `store.Transition` per step (each its own
+  transaction, outbox row and rv check):
+  ```
+  after create commits:  SCHEDULED → PROVISIONING → RUNNING
+  on DELETE:             <current> → TERMINATING → TERMINATED  (releases GPUs + quota)
+  ```
+  DELETE from SCHEDULED or PROVISIONING uses the existing `→ TERMINATING`
+  edges. No sleeps. The state machine and the event history are identical to
+  M2; only *who* calls `Transition` changes.
+
+**Decision.** **B** (tech lead's call).
+- API contract is the same in M1 and M2: `POST` returns `202` with the state
+  at commit (SCHEDULED); a `GET` right after shows RUNNING. `DELETE` returns
+  `202`; the instance ends TERMINATED. A client that "polls until RUNNING"
+  works unchanged when M2 adds real delays.
+- Final state stays TERMINATED (no DELETED state); rows are kept for billing
+  history.
+- Driver errors are logged; the instance stays in its last committed state.
+- **Accepted M1 weakness:** if the apiserver crashes between the create commit
+  and the driver's steps (or mid-delete), the instance is left in SCHEDULED /
+  PROVISIONING / TERMINATING. Nothing repairs it in M1. The M2 controller's
+  level-triggered reconcile fixes it, and the driver is deleted then.
+
+**Protects:** invariant 3 (every step is its own transaction with exactly one
+outbox row) and invariant 5 (capacity and quota released only in the
+transaction that reaches TERMINATED).
 
 ---
 

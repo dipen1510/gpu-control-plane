@@ -39,6 +39,9 @@ every state-change transaction; a store-level transition function; metrics.
 - *Lifecycle:* states after SCHEDULED are driven by an internal function,
   `store.Transition`, which M1 tests call directly. In M2 the controller
   calls the very same function, so the logic is built and tested once.
+  *(Amended: in M1 an instant lifecycle driver in the apiserver also calls
+  `store.Transition`, so create reaches RUNNING and DELETE reaches TERMINATED
+  over HTTP. See Amendment 1.)*
 
 ## Concepts (for the tech lead)
 
@@ -99,16 +102,17 @@ Errors use one envelope: `{"error": {"code": "...", "message": "..."}}`.
 
 | Request | Success | Errors |
 |---|---|---|
-| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}`, `ETag` | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` |
+| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}` (state at commit), `ETag`; in M1 a `GET` right after shows RUNNING (Amendment 1) | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` |
 | `GET /v1/instances/{id}`, optional `If-None-Match` | `200` instance, `ETag: "<rv>"`; `304` if rv unchanged | `400` (no tenant) · `404 not_found` (also for another tenant's instance — don't leak existence) |
-| `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING | `404` · `409 stale_resource_version` · `409 invalid_transition` |
+| `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING; the instance ends TERMINATED with GPUs and quota released (Amendment 1) | `404` · `409 stale_resource_version` · `409 invalid_transition` |
 
 A replayed create returns `202` with the original instance id, its *current*
 state, and `Idempotent-Replayed: true`. DELETE is idempotent: on an instance
-already TERMINATING, TERMINATED or FAILED it returns `202` with the current
-state and writes no event. DELETE on a SCHEDULED instance moves it to
-TERMINATING (Q1). Clients learn about state changes by polling GET with
-`If-None-Match` (Discussion D16).
+already TERMINATED or FAILED it returns `202` with the current state and
+writes no event; on TERMINATING it finishes the walk to TERMINATED
+(Amendment 1). DELETE works from SCHEDULED, PROVISIONING and RUNNING (Q1).
+Clients learn about state changes by polling GET with `If-None-Match`
+(Discussion D16).
 
 ### The create transaction, step by step
 
@@ -200,6 +204,9 @@ key back, so retrying the same key later can succeed when capacity frees up
 | C. Admin HTTP endpoint to set state | Easy manual testing | An API that bypasses the real driver; must be removed later |
 
 **Choice:** A. **Protects:** invariants 3, 4, 5.
+*(Amended: "unreachable over HTTP" left DELETE unable to release capacity. M1
+adds an instant lifecycle driver that calls the same `store.Transition` with
+no timers or sleeps, unlike option B. See Amendment 1.)*
 
 ### M1-d: Test database
 | Option | Pros | Cons |
@@ -257,16 +264,69 @@ Logs: `log/slog` JSON with `instance_id`, `tenant`, `node_id`, `state`,
 
 ## Stories
 
-S1-1 to S1-13 in `docs/backlog.md` (Milestone 1). Test-engineer stories
+S1-1 to S1-14 in `docs/backlog.md` (Milestone 1; S1-14 from Amendment 1). Test-engineer stories
 S1-11 and S1-12 are written from this ADR in parallel with the implementer.
 
 ## Resolved questions (tech lead, 2026-10-16)
 
 - **Q1. DELETE on a SCHEDULED instance:** add the `SCHEDULED → TERMINATING`
   edge (mirrors PROVISIONING → TERMINATING). DELETE works from SCHEDULED,
-  PROVISIONING and RUNNING.
+  PROVISIONING and RUNNING. *Revised in Amendment 1:* DELETE then continues
+  to TERMINATED in M1 via the instant lifecycle driver.
 - **Q2. Failed creates and the key:** 403/503 are not stored under the key;
-  the same key can be retried later (M1-b).
-- **Q3. Tenant identity:** `X-Tenant-ID` header with no auth for M1.
+  the `idempotency_keys` row is inserted inside the create transaction, so
+  the rollback removes it and the same key can be retried later (M1-b;
+  re-confirmed 2026-10-16).
+- **Q3. Tenant identity:** `X-Tenant-ID` header with no auth for M1
+  (re-confirmed 2026-10-16).
 - Also accepted: `Retry-After: 30` on 503; make targets `db-up`, `db-down`,
   `test-integration`, `seed-nodes`.
+
+## Amendment 1 (2026-10-16): instant lifecycle driver
+
+Decided by the tech lead; reasoning in `docs/Discussion.md` D17.
+
+**Problem.** With M1-c as written, nothing moved an instance to TERMINATED,
+so `DELETE` never released GPUs or quota over HTTP.
+
+**Change.** A small driver in the apiserver (`internal/lifecycle`, M1 only)
+walks the legal path right away, one `store.Transition` per step. Each step
+is its own transaction with one outbox row and an rv check; each step uses
+the rv returned by the previous one.
+
+```
+POST   : create txn commits ─► respond 202 {state: SCHEDULED}
+         driver: SCHEDULED ─► PROVISIONING ─► RUNNING
+DELETE : <cur> ─► TERMINATING ─► TERMINATED   (release GPUs + quota)
+         respond 202 {state: TERMINATING}
+```
+
+- The state machine is **not** changed: no shortcut edges. DELETE from
+  SCHEDULED/PROVISIONING uses the existing `→ TERMINATING` edges.
+- The driver runs **in the request, after commit and before the response**,
+  on a context detached from client cancellation (`context.WithoutCancel` +
+  a short timeout), so a test's `GET` right after the response is
+  deterministic. The response body is the state the request's own transaction
+  committed (SCHEDULED for create, TERMINATING for DELETE), exactly as in M2.
+- No `time.Sleep`, timers or goroutines that outlive the request.
+- On any error (including `ErrStaleVersion` because a concurrent DELETE won)
+  the driver logs it and stops; the instance stays in its last committed
+  state. A create-driver step losing to a DELETE is expected and harmless.
+- DELETE without `If-Match` re-reads and retries a stale rv a bounded number
+  of times (3) before `409`; with a stale `If-Match` it returns `409` at once.
+- Final state stays TERMINATED; rows are kept for billing history.
+
+**Accepted weakness.** A crash between the create commit and the driver's
+steps leaves the instance in SCHEDULED or PROVISIONING; a crash mid-delete
+leaves it in TERMINATING. Nothing repairs it automatically in M1. A user can
+still DELETE it (all three states accept DELETE), which releases capacity.
+The M2 controller's level-triggered reconcile fixes it properly, and the
+driver is deleted in M2.
+
+**Unchanged for clients in M2.** POST → `202` SCHEDULED, DELETE → `202`
+TERMINATING, poll GET for RUNNING / TERMINATED. Only the time between states
+grows. The outbox history is identical in M1 and M2.
+
+**Protects:** invariant 3 (one outbox row per step), invariant 4 (every step
+carries the rv), invariant 5 (release only in the transaction that reaches
+TERMINATED). Story: S1-14.

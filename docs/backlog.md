@@ -38,6 +38,18 @@ Acceptance:
     verifiable acceptance criteria
 Out of scope: writing any Go code
 
+### A-3 (1 pt) — Design update: M1 instant lifecycle driver
+Owner: architect        Reviewer: tech lead        Status: Done
+Result: Discussion D17 (+ D12 note), ADR-0001 Amendment 1, story S1-14 (Proposed),
+S1-6/S1-8/S1-10/S1-11 updated
+Depends on: A-2
+Why: in M1 nothing moved an instance to TERMINATED, so DELETE never released GPUs or quota over HTTP
+Acceptance:
+  - D17 records options A (shortcut edges) vs B (instant driver) and the decision (B)
+  - ADR-0001 records it as an amendment, not a silent rewrite; API table, M1-c and Q1 point to it
+  - no files changed outside docs/
+Out of scope: CLAUDE.md state-machine note (outside architect's write scope; orchestrator/tech lead)
+
 ### Milestone 1 stories (from ADR-0001)
 
 Summary (details below). Integration tests need `make db-up` first.
@@ -53,13 +65,15 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Proposed |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Proposed |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Proposed |
-| S1-10 | 1 | DELETE moves instance to TERMINATING | implementer | S1-9 | Proposed |
-| S1-11 | 2 | Concurrency test: no over-allocation, no over-quota | test-engineer | S1-2 | Proposed |
+| S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Proposed |
+| S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
+| S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Proposed |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
-the ADR in parallel with S1-5…S1-10 and are expected to fail until those land.
+the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
+those land.
 
 ### S1-1 (1 pt) — State machine rules
 Owner: implementer        Reviewer: verifier        Status: Proposed
@@ -156,12 +170,16 @@ Acceptance:
     `used += n`, `Place`, INSERT instance, INSERT outbox `instance.scheduled`
   - `400 invalid_request` for missing `X-Tenant-ID`, missing `Idempotency-Key`,
     unknown gpu_type, gpu_count not in {1,2,4,8}; `TestCreateValidation` table-driven
-  - integration test `TestCreateHappyPath`: after create, exactly 1 instance, 1 outbox row,
-    `nodes.allocated` and `tenant_quota.used` increased by gpu_count
+  - integration test `TestCreateHappyPath`: after create, exactly 1 instance, exactly 1
+    `instance.scheduled` outbox row, `nodes.allocated` and `tenant_quota.used` increased by
+    gpu_count
+  - GET tests assert the instance as currently stored, not a hardcoded SCHEDULED / rv 1,
+    so they keep passing once S1-14 moves it to RUNNING after create
   - integration test `TestGetOtherTenantIs404`
   - integration test `TestCreateRollsBackOnFailure`: an injected error after `Place` leaves
     no instance, no outbox row, and unchanged `allocated`/`used`
-Out of scope: 403/503 (S1-7), idempotency replay (S1-8), DELETE (S1-10)
+Out of scope: 403/503 (S1-7), idempotency replay (S1-8), DELETE (S1-10), GET showing
+RUNNING after create (S1-14)
 
 ### S1-7 (1 pt) — Create fails cleanly: quota 403, capacity 503
 Owner: implementer        Reviewer: verifier        Status: Proposed
@@ -186,7 +204,8 @@ Acceptance:
   - `idempotency_keys` row inserted first in the create transaction, keyed by
     (tenant_id, key) with SHA-256 of the canonical parsed body
   - integration test `TestIdempotentReplay`: same key + same body → `202`, same id,
-    `Idempotent-Replayed: true`, still 1 instance and 1 outbox row, quota counted once
+    `Idempotent-Replayed: true`, still 1 instance and 1 `instance.scheduled` outbox row,
+    quota counted once; the replay does not re-run the lifecycle driver (no extra outbox rows)
   - `TestIdempotentReplayIgnoresFormatting`: same body with different whitespace /
     field order → replay, not 409
   - `TestIdempotencyKeyReused`: same key + different body → `409 idempotency_key_reused`
@@ -214,19 +233,25 @@ Acceptance:
   - `TestTerminalNeverChanges`: any transition from TERMINATED/FAILED → `ErrInvalidTransition`
 Out of scope: provisioning timeout and Pods (M2); HTTP exposure beyond DELETE (S1-10)
 
-### S1-10 (1 pt) — DELETE moves instance to TERMINATING
+### S1-10 (1 pt) — DELETE ends at TERMINATED and releases capacity
 Owner: implementer        Reviewer: verifier        Status: Proposed
-Why: users must be able to stop paying; a stale client must not override a newer state (invariant 4)
-Design link: ADR-0001 §API (M1), Q1 (resolved)
-Depends on: S1-9
+Why: users must be able to stop paying and get their quota back; a stale client must not override a newer state (invariant 4)
+Design link: ADR-0001 §API (M1), Q1 (resolved), Amendment 1; Discussion D17
+Depends on: S1-9, S1-14
 Acceptance:
-  - `DELETE /v1/instances/{id}` on SCHEDULED, PROVISIONING or RUNNING → `202` state TERMINATING
-    via `store.Transition`; capacity is NOT released yet (invariant 5)
-  - `If-Match: "<rv>"` stale → `409 stale_resource_version`; absent → current rv used
-  - already TERMINATING/TERMINATED/FAILED → `202` current state, no new outbox row
+  - `DELETE /v1/instances/{id}` on SCHEDULED, PROVISIONING or RUNNING → `202` with state
+    TERMINATING; the handler calls the S1-14 driver, so a `GET` right after shows TERMINATED
+    and `nodes.allocated` / `tenant_quota.used` are back to their pre-create values
+    (`TestDeleteFromEachStateEndsTerminated`, one sub-test per starting state)
+  - capacity is released only in the TERMINATING → TERMINATED transaction (invariant 5)
+  - `If-Match: "<rv>"` stale → `409 stale_resource_version`, nothing changed; absent → current
+    rv used, re-read and retried up to 3 times on `ErrStaleVersion`
+  - already TERMINATED/FAILED → `202` current state, no new outbox row; TERMINATING (left by
+    a crash) → `202`, driver finishes the walk to TERMINATED (`TestDeleteResumesTerminating`)
   - other tenant's or unknown id → `404`
   - integration tests `TestDelete*` cover each line above
-Out of scope: driving TERMINATING → TERMINATED (M2 controller)
+  - after delete, the tenant can create again up to its full 16 GPUs (`TestDeleteFreesQuota`)
+Out of scope: Pods and real shutdown delay (M2 controller)
 
 ### S1-11 (2 pts) — Concurrency test: no over-allocation, no over-quota
 Owner: test-engineer        Reviewer: verifier        Status: Proposed
@@ -242,7 +267,15 @@ Acceptance:
     more than 16 GPUs total with ample capacity; asserts active GPUs ≤ 16 and
     `used` = sum of active instances; the rest got 403
   - `TestConcurrentLastGPUs`: 100 goroutines race for the final 2 GPUs → exactly one 202
-  - every successful create has exactly one outbox row; tests pass with `-count=5`
+  - `TestConcurrentCreateDeleteChurn` (may fail until S1-14 and S1-10 land): ≥50 goroutines
+    loop create → delete through the lifecycle driver for several rounds, total demand over
+    time > fleet capacity; asserts `allocated <= capacity` and `used <= quota_limit` at every
+    sample, invariant 7 at the end, every instance ends RUNNING or TERMINATED (none stuck),
+    and after all deletes `allocated` and `used` are back to 0
+  - also in churn: deletes racing the create driver on the same instance → driver stops on
+    `ErrStaleVersion`, instance still ends TERMINATED, released exactly once
+  - every successful create has exactly one `instance.scheduled` outbox row, and each instance
+    has exactly one outbox row per state it passed through; tests pass with `-count=5`
 Out of scope: chaos (M4); multiple OS processes
 
 ### S1-12 (2 pts) — Spec tests: idempotency races and state machine
@@ -275,3 +308,33 @@ Acceptance:
   - `/healthz` → 200; `/readyz` → 503 when the DB is unreachable (`TestReadyzDBDown`)
   - structured slog fields `instance_id`, `tenant`, `node_id`, `state` on create/transition logs
 Out of scope: OpenTelemetry traces, dashboards, alert rules (M4)
+
+### S1-14 (1 pt) — M1 instant lifecycle driver
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: without it nothing reaches TERMINATED in M1, so DELETE never gives back GPUs or quota (invariant 5)
+Design link: ADR-0001 Amendment 1; Discussion D17, D12
+Depends on: S1-9
+Acceptance:
+  - `internal/lifecycle` (M1 only) with `AfterCreate(ctx, id, rv)` walking
+    SCHEDULED → PROVISIONING → RUNNING and `Delete(ctx, id, expectedRV)` walking
+    `<current>` → TERMINATING → TERMINATED, one `store.Transition` per step, each step using
+    the rv returned by the previous one; the state machine (S1-1) is unchanged
+  - the create handler calls `AfterCreate` after commit and before responding, on
+    `context.WithoutCancel` + timeout; the response still reports state SCHEDULED, rv 1
+  - integration test `TestCreateThenGetIsRunning`: POST → `202` SCHEDULED; immediate GET →
+    RUNNING, rv 3
+  - integration test `TestDeleteEndsTerminatedAndReleases`: from RUNNING, `Delete` → state
+    TERMINATED, `allocated`/`used` back to pre-create values, released exactly once
+  - `TestDriverOutboxOnePerStep`: create + delete gives exactly 5 outbox rows in order
+    scheduled, provisioning, running, terminating, terminated
+  - `TestDriverStopsOnError`: an injected `Transition` error (or `ErrStaleVersion`) at each
+    step → logged with `instance_id`, `state`, error; instance left in its last committed
+    state; no further steps; create still returns `202`
+  - `TestDriverLosesToDelete`: a DELETE that wins the race makes `AfterCreate` stop on
+    `ErrStaleVersion`; instance ends TERMINATED
+  - no `time.Sleep`, timers or goroutines outliving the request in `internal/lifecycle`
+    (verifier greps); the driver is injected into the handler so it can be swapped for the
+    M2 controller
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: crash recovery of stuck instances (M2 controller); delays, timeouts, boot
+failures (M2); HTTP DELETE wiring (S1-10)
