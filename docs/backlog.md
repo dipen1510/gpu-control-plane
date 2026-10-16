@@ -17,7 +17,8 @@ APPROVE moves a story to Done.
 ## Milestone 1 — API + Postgres + state machine + idempotency
 
 ### A-1 (1 pt) — System design walkthrough
-Owner: architect        Reviewer: tech lead        Status: Proposed
+Owner: architect        Reviewer: tech lead        Status: Done
+Result: docs/Discussion.md (15 v1 decisions + v2 deferrals)
 Why: the tech lead should understand the whole system before any code exists.
 Acceptance:
   - architect explains components, request flow, state machine, data model,
