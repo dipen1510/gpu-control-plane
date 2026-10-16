@@ -28,7 +28,7 @@ PENDING → SCHEDULED → PROVISIONING → RUNNING → TERMINATING → TERMINATE
    │           │            │
    └───────────┴────────────┴──► FAILED  (terminal; capacity is released)
 
-also: PROVISIONING → TERMINATING   (user deletes while booting)
+also: SCHEDULED → TERMINATING, PROVISIONING → TERMINATING   (user deletes before RUNNING)
 ```
 Rules: transitions only move forward; every transition is a single DB
 transaction that also writes an outbox event; a terminal state never changes.

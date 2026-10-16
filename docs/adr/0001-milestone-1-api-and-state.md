@@ -1,6 +1,6 @@
 # ADR-0001: Milestone 1 — API server, Postgres state, placement and idempotency
 
-Status: Proposed
+Status: Accepted (tech lead, 2026-10-16)
 Date: 2026-10-15
 Milestone: 1
 
@@ -100,14 +100,15 @@ Errors use one envelope: `{"error": {"code": "...", "message": "..."}}`.
 | Request | Success | Errors |
 |---|---|---|
 | `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}`, `ETag` | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` |
-| `GET /v1/instances/{id}` | `200` instance, `ETag: "<rv>"` | `400` (no tenant) · `404 not_found` (also for another tenant's instance — don't leak existence) |
+| `GET /v1/instances/{id}`, optional `If-None-Match` | `200` instance, `ETag: "<rv>"`; `304` if rv unchanged | `400` (no tenant) · `404 not_found` (also for another tenant's instance — don't leak existence) |
 | `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING | `404` · `409 stale_resource_version` · `409 invalid_transition` |
 
 A replayed create returns `202` with the original instance id, its *current*
 state, and `Idempotent-Replayed: true`. DELETE is idempotent: on an instance
 already TERMINATING, TERMINATED or FAILED it returns `202` with the current
-state and writes no event. DELETE on a SCHEDULED instance depends on open
-question Q1.
+state and writes no event. DELETE on a SCHEDULED instance moves it to
+TERMINATING (Q1). Clients learn about state changes by polling GET with
+`If-None-Match` (Discussion D16).
 
 ### The create transaction, step by step
 
@@ -259,15 +260,13 @@ Logs: `log/slog` JSON with `instance_id`, `tenant`, `node_id`, `state`,
 S1-1 to S1-13 in `docs/backlog.md` (Milestone 1). Test-engineer stories
 S1-11 and S1-12 are written from this ADR in parallel with the implementer.
 
-## Open questions
+## Resolved questions (tech lead, 2026-10-16)
 
-- **Q1. DELETE on a SCHEDULED instance.** The state machine has no
-  `SCHEDULED → TERMINATING` edge. In M1 nothing moves an instance past
-  SCHEDULED, so this is the most common delete. Recommendation: add that edge
-  (it mirrors the existing PROVISIONING → TERMINATING). Until you decide,
-  S1-10 returns `409 invalid_transition` for it.
-- **Q2. Failed creates and the key.** Recommended (M1-b): 403/503 are not
-  remembered under the key, so the same key can be retried later. The other
-  choice is to store and replay the error.
-- **Q3. Tenant identity.** `X-Tenant-ID` header with no auth for M1. Is that
-  acceptable until a later milestone?
+- **Q1. DELETE on a SCHEDULED instance:** add the `SCHEDULED → TERMINATING`
+  edge (mirrors PROVISIONING → TERMINATING). DELETE works from SCHEDULED,
+  PROVISIONING and RUNNING.
+- **Q2. Failed creates and the key:** 403/503 are not stored under the key;
+  the same key can be retried later (M1-b).
+- **Q3. Tenant identity:** `X-Tenant-ID` header with no auth for M1.
+- Also accepted: `Retry-After: 30` on 503; make targets `db-up`, `db-down`,
+  `test-integration`, `seed-nodes`.

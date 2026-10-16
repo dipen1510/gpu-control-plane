@@ -29,6 +29,7 @@ order we worked it out.
 | D13 | Leader election | Controller only |
 | D14 | Fake GPUs | kind workers + label + extended resource `gpu.example.com/gpu: 8`; instance = Pod |
 | D15 | Node inventory | Rows inserted once via Node sync; placement only updates `allocated`; single owner per column; drift reconciler |
+| D16 | Client notifications | Clients poll `GET` with `If-None-Match` (304 when unchanged); push (webhook / SSE / watch) deferred to M3+ on the outbox and event bus |
 
 ---
 
@@ -462,6 +463,41 @@ each column has **one owner**: sync owns `gpu_type`, `capacity`,
 rather than silently fixing it.
 
 **Protects:** invariant 1.
+
+---
+
+## D16 — How clients learn about state changes
+
+**Question.** Should we add the controller and SSE notifications to M1? And in
+production, is SSE used, or does the dashboard call the status API?
+
+**Discussion — SSE is easy, delivery is hard.** Pushing over SSE raises:
+which API replica holds the client's connection (fan-out via Postgres
+LISTEN/NOTIFY or NATS), how a client resumes after a disconnect without
+missing a state (`Last-Event-ID` = outbox id; notifications are hints, the
+outbox is the truth), ordering and duplicates (at-least-once, dedupe by event
+id), heartbeats, per-tenant connection limits. Adding the controller to M1
+would also grow M1 to ~20 stories.
+
+**Discussion — what production does.** For instance state, polling is the
+norm: consoles refresh lists on an interval, CLIs "wait" by polling (e.g.
+`aws ec2 wait instance-running` polls every 15 s). Push is used for
+automation through a separate channel (webhooks, event buses such as AWS
+EventBridge state-change events), and Kubernetes clients use a watch from a
+resourceVersion. SSE shines where updates are frequent (LLM token streams,
+live logs). Polling wins here because state changes are rare, requests are
+stateless (any replica answers), it works through every proxy, and GET always
+reads the source of truth.
+
+**Making polling cheap.** `GET` returns `ETag: "<rv>"`; the client sends
+`If-None-Match: "<rv>"` and gets `304 Not Modified` when nothing changed.
+Dashboards also pause polling when the tab is hidden.
+
+**Decision.** No controller and no SSE in M1 (tech lead's call; the
+controller stays in M2). Clients poll `GET /v1/instances/{id}` with
+`If-None-Match`. Push notifications (webhook or SSE/watch) are deferred to M3+
+and will be built from the outbox and event bus, never as a second source of
+truth.
 
 ---
 

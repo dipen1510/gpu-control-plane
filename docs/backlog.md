@@ -70,10 +70,11 @@ Acceptance:
   - `internal/statemachine` defines the 7 states and `CanTransition(from, to State) bool`,
     `IsTerminal(State) bool`, `HoldsCapacity(State) bool`; no I/O, no DB imports
   - `TestCanTransition` is table-driven over all 49 (from, to) pairs and matches the
-    CLAUDE.md diagram exactly (includes PROVISIONING → TERMINATING; no backward edges)
+    CLAUDE.md diagram exactly (includes SCHEDULED → TERMINATING and PROVISIONING → TERMINATING;
+    no backward edges)
   - `TestTerminalStatesNeverChange`: no edge leaves TERMINATED or FAILED
   - `make test` and `make lint` pass
-Out of scope: persistence (S1-9); SCHEDULED → TERMINATING edge (ADR-0001 Q1)
+Out of scope: persistence (S1-9)
 
 ### S1-2 (2 pts) — Schema, migrations and test database
 Owner: implementer        Reviewer: verifier        Status: Proposed
@@ -149,6 +150,8 @@ Depends on: S1-1, S1-5
 Acceptance:
   - `cmd/apiserver` serves `POST /v1/instances` → `202` with state SCHEDULED, node_id,
     resource_version 1 and an `ETag`; `GET /v1/instances/{id}` → `200` same instance
+  - `GET` with `If-None-Match: "<rv>"` matching the current rv → `304 Not Modified`, no body
+    (`TestGetConditional`; Discussion D16)
   - one transaction in the documented lock order: quota row (created at 16 if missing)
     `used += n`, `Place`, INSERT instance, INSERT outbox `instance.scheduled`
   - `400 invalid_request` for missing `X-Tenant-ID`, missing `Idempotency-Key`,
@@ -214,14 +217,13 @@ Out of scope: provisioning timeout and Pods (M2); HTTP exposure beyond DELETE (S
 ### S1-10 (1 pt) — DELETE moves instance to TERMINATING
 Owner: implementer        Reviewer: verifier        Status: Proposed
 Why: users must be able to stop paying; a stale client must not override a newer state (invariant 4)
-Design link: ADR-0001 §API (M1); open question Q1
+Design link: ADR-0001 §API (M1), Q1 (resolved)
 Depends on: S1-9
 Acceptance:
-  - `DELETE /v1/instances/{id}` on PROVISIONING or RUNNING → `202` state TERMINATING
+  - `DELETE /v1/instances/{id}` on SCHEDULED, PROVISIONING or RUNNING → `202` state TERMINATING
     via `store.Transition`; capacity is NOT released yet (invariant 5)
   - `If-Match: "<rv>"` stale → `409 stale_resource_version`; absent → current rv used
   - already TERMINATING/TERMINATED/FAILED → `202` current state, no new outbox row
-  - SCHEDULED → `409 invalid_transition` until Q1 is decided
   - other tenant's or unknown id → `404`
   - integration tests `TestDelete*` cover each line above
 Out of scope: driving TERMINATING → TERMINATED (M2 controller)
