@@ -59,7 +59,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-1 | 1 | State machine rules | implementer | — | Done |
 | S1-2 | 2 | Schema, migrations and test database | implementer | — | Proposed |
 | S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Proposed |
-| S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Proposed |
+| S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Proposed |
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Proposed |
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Proposed |
@@ -125,7 +125,10 @@ Acceptance:
 Out of scope: the M2 node sync loop; deleting nodes
 
 ### S1-4 (1 pt) — Node ranking: filter, best fit, tie-break
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Follow-ups from review: ADR step 3 should list the D5 health tie-break; S1-13 must split nodes by
+gpu_type before calling FragmentedGPUs; add an over-allocated-node case to TestFragmentedGPUs;
+S1-5 passes a nil IntN (global, concurrency-safe rand) in production.
 Why: best fit keeps whole nodes free for 8-GPU requests (D7); ranking is pure logic, so it is tested without a DB
 Design link: ADR-0001 §The create transaction step 3; Discussion D5, D7
 Depends on: —
