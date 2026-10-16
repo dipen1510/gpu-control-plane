@@ -57,7 +57,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | ID | Pts | Story | Owner | Depends on | Status |
 |---|---|---|---|---|---|
 | S1-1 | 1 | State machine rules | implementer | — | Done |
-| S1-2 | 2 | Schema, migrations and test database | implementer | — | Proposed |
+| S1-2 | 2 | Schema, migrations and test database | implementer | — | Done |
 | S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Proposed |
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Proposed |
@@ -69,11 +69,25 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
+| S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Proposed |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Proposed |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
 the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
+
+### S1-15 (1 pt) — `make lint` fails on real lint errors
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: today `command -v staticcheck && staticcheck ./... || echo …` succeeds even when staticcheck
+reports problems, and `golangci-lint … || true` hides that it can't run on Go 1.26 — a lint step
+that can't fail checks nothing
+Depends on: —
+Acceptance:
+  - `make lint` exits non-zero when staticcheck reports a finding (shown by a deliberate violation
+    in a scratch copy) and when staticcheck is missing it prints how to install it and fails
+  - staticcheck also runs with `-tags=integration`
+  - golangci-lint is either removed or only run when its Go version supports the module
+Out of scope: adding new linters
 
 ### S1-1 (1 pt) — State machine rules
 Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
@@ -94,7 +108,12 @@ Acceptance:
 Out of scope: persistence (S1-9)
 
 ### S1-2 (2 pts) — Schema, migrations and test database
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Follow-ups from review: `make db-up`/`db-down` untested here (no Docker) — tech lead to run on Mac;
+mark the test template `ALLOW_CONNECTIONS false` so an open psql session can't break test setup;
+runner has no per-migration checksum (edits to applied migrations go unnoticed — fine for M1);
+M3 relay must scan `WHERE published_at IS NULL`, never a "last id seen" cursor (outbox id order ≠
+commit order); `make lint` can't fail on staticcheck findings (see S1-15).
 Why: the CHECK constraints are the last line of defense for invariants 1 and 6, even against buggy queries
 Design link: ADR-0001 §Data model, §M1-d
 Depends on: —
