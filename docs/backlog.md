@@ -58,7 +58,7 @@ Summary (details below). Integration tests need `make db-up` first.
 |---|---|---|---|---|---|
 | S1-1 | 1 | State machine rules | implementer | — | Done |
 | S1-2 | 2 | Schema, migrations and test database | implementer | — | Done |
-| S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Proposed |
+| S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Done |
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Proposed |
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Proposed |
@@ -131,7 +131,10 @@ Acceptance:
 Out of scope: any query code beyond the migration runner
 
 ### S1-3 (1 pt) — Seed fake nodes
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Follow-ups from review: re-seeding sets schedulable=true (seed owns that column per D15), so it
+un-cordons nodes — S1-11/S1-12 must not re-seed mid-test; validate N before connecting and reject
+extra CLI args (small polish).
 Why: M1 has no node sync loop (that is M2), so placement needs inventory from somewhere
 Design link: ADR-0001 §Context "How M1 works without a controller"; Discussion D15
 Depends on: S1-2

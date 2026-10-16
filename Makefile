@@ -6,7 +6,10 @@ PG_CONTAINER ?= gpucp-postgres
 PG_IMAGE     ?= postgres:16
 DATABASE_URL ?= postgres://gpucp:gpucp@localhost:5432/gpucp?sslmode=disable
 
-.PHONY: test test-integration lint db-up db-down kind-up kind-down deploy
+# Fake nodes for `make seed-nodes` (ADR-0001: M1 has no node sync loop).
+N ?= 10
+
+.PHONY: test test-integration lint db-up db-down seed-nodes kind-up kind-down deploy
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -38,6 +41,11 @@ db-up:
 		sleep 1; \
 	done; \
 	echo "postgres in $(PG_CONTAINER) did not become ready" >&2; docker logs --tail 20 $(PG_CONTAINER) >&2; exit 1
+
+# Upsert N fake GPU nodes (half H100, half A100) into DATABASE_URL, applying
+# migrations first. Re-running is safe and never changes `allocated` (D15).
+seed-nodes:
+	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/seed-nodes -n $(N)
 
 # Stop and remove the container and its data.
 db-down:
