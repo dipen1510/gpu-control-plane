@@ -60,7 +60,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-2 | 2 | Schema, migrations and test database | implementer | — | Done |
 | S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Done |
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
-| S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Proposed |
+| S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Done |
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Proposed |
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Proposed |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Proposed |
@@ -167,7 +167,14 @@ Acceptance:
 Out of scope: DB writes (S1-5)
 
 ### S1-5 (2 pts) — Place: atomic reserve with fallback
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE on 2nd review, 2026-10-16)
+Review history: 1st review CHANGES REQUESTED — under READ COMMITTED, an UPDATE that waited on a
+row lock and then matched 0 rows KEEPS that lock, so Place could hold 2+ node locks and deadlock
+(40P01 in 5/40 runs). Fixed with a savepoint per reserve attempt (rollback releases the lock);
+TestPlaceReleasesLockOnLostRace reproduces the contended path (fails 10/10 without the fix).
+Follow-ups: ADR-0001 step 3 text "losing candidates are not locked" needs an amendment (savepoint);
+S1-11 must fail on any 40P01; assign `gpucp_scheduler_place_duration_seconds` to S1-13 (each
+attempt now costs 3 round trips); export a holding-states list from statemachine.
 Why: the snapshot may be stale; the conditional UPDATE is what actually prevents over-allocation
 Design link: ADR-0001 §The create transaction step 3, §M1-a; Discussion D4, D5, D10
 Depends on: S1-2, S1-4

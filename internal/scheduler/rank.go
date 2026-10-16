@@ -2,7 +2,7 @@
 //
 // It runs in two halves. Ranking (this file) is pure logic: given a snapshot
 // of nodes and a request, it returns candidate nodes best-first. It touches
-// no database, so it is easy to test. Placement (S1-5) then tries to reserve
+// no database, so it is easy to test. Placement (place.go) then tries to reserve
 // GPUs on each candidate in order with a conditional UPDATE; that UPDATE, not
 // the ranking, is what prevents over-allocation (invariant 1), because the
 // snapshot ranking is based on may already be stale.
