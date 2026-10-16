@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,13 +24,20 @@ import (
 
 // Store is what the handlers need from the store. *store.Store satisfies it.
 type Store interface {
-	Create(ctx context.Context, req store.CreateRequest) (store.Instance, error)
+	Create(ctx context.Context, req store.CreateRequest) (store.CreateResult, error)
 	Get(ctx context.Context, tenantID, id string) (store.Instance, error)
 }
 
 const (
 	headerTenant         = "X-Tenant-ID"
 	headerIdempotencyKey = "Idempotency-Key"
+	headerReplayed       = "Idempotent-Replayed"
+
+	// Header length limits. Both values end up in primary keys, and a
+	// Postgres btree entry cannot exceed ~2.7 KB, so an unbounded value
+	// would turn into a 500 instead of a 400.
+	maxTenantLen = 64
+	maxKeyLen    = 255
 
 	// maxBodyBytes bounds the create body; a valid one is ~40 bytes.
 	maxBodyBytes = 4 << 10
@@ -49,6 +57,7 @@ const (
 	codeRequestTooLarge      = "request_too_large"
 	codeRequestTimeout       = "request_timeout"
 	codeQuotaExceeded        = "quota_exceeded"
+	codeKeyReused            = "idempotency_key_reused"
 	codeNotFound             = "not_found"
 	codeInsufficientCapacity = "insufficient_capacity"
 	codeInternal             = "internal"
@@ -110,14 +119,14 @@ func toResponse(inst store.Instance) instanceResponse {
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get(headerTenant)
-	if tenant == "" {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "missing "+headerTenant+" header")
+	tenant, reqErr := headerValue(r, headerTenant, maxTenantLen)
+	if reqErr != nil {
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
-	key := r.Header.Get(headerIdempotencyKey)
-	if key == "" {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "missing "+headerIdempotencyKey+" header")
+	key, reqErr := headerValue(r, headerIdempotencyKey, maxKeyLen)
+	if reqErr != nil {
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
 	body, reqErr := decodeCreate(w, r)
@@ -130,13 +139,27 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hash, err := requestHash(body)
+	if err != nil {
+		h.internalError(w, "create instance", err, "tenant", tenant)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
-	inst, err := h.store.Create(ctx, store.CreateRequest{
+	res, err := h.store.Create(ctx, store.CreateRequest{
 		ID: newInstanceID(), TenantID: tenant, GPUType: body.GPUType, GPUCount: body.GPUCount,
-		IdempotencyKey: key, // RequestHash: S1-8
+		IdempotencyKey: key, RequestHash: hash,
 	})
 	switch {
+	case errors.Is(err, store.ErrIdempotencyKeyReused):
+		// 409: the client sent a different request under a key it already
+		// used. Retrying the same request will not help.
+		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
+			"gpu_count", body.GPUCount, "result", codeKeyReused)
+		writeError(w, http.StatusConflict, codeKeyReused,
+			headerIdempotencyKey+" was already used with a different request body")
+		return
 	case errors.Is(err, store.ErrQuotaExceeded):
 		// 403: retrying will not help until the tenant frees GPUs (D2).
 		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
@@ -159,15 +182,24 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
 		return
 	}
-	h.log.Info("instance created", "instance_id", inst.ID, "tenant", tenant, "node_id", inst.NodeID,
-		"state", inst.State, "resource_version", inst.ResourceVersion, "result", "scheduled")
-	writeInstance(w, http.StatusAccepted, inst)
+	if res.Replayed {
+		// Same key, same body: the earlier instance as it is now, nothing
+		// written (ADR-0001 §API).
+		h.log.Info("create replayed", "instance_id", res.ID, "tenant", tenant, "node_id", res.NodeID,
+			"state", res.State, "resource_version", res.ResourceVersion, "result", "replayed")
+		w.Header().Set(headerReplayed, "true")
+		writeInstance(w, http.StatusAccepted, res.Instance)
+		return
+	}
+	h.log.Info("instance created", "instance_id", res.ID, "tenant", tenant, "node_id", res.NodeID,
+		"state", res.State, "resource_version", res.ResourceVersion, "result", "scheduled")
+	writeInstance(w, http.StatusAccepted, res.Instance)
 }
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get(headerTenant)
-	if tenant == "" {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "missing "+headerTenant+" header")
+	tenant, reqErr := headerValue(r, headerTenant, maxTenantLen)
+	if reqErr != nil {
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
 	id := r.PathValue("id")
@@ -248,6 +280,39 @@ func decodeCreate(w http.ResponseWriter, r *http.Request) (createRequest, *reque
 		return createRequest{}, invalid(fmt.Sprintf("gpu_count must be 1, 2, 4 or 8, got %d", body.GPUCount))
 	}
 	return body, nil
+}
+
+// headerValue returns the named header, which must be present, at most
+// maxLen bytes, and only visible ASCII (0x21–0x7E: no spaces, control
+// characters or non-ASCII bytes). The value is never echoed back.
+func headerValue(r *http.Request, name string, maxLen int) (string, *requestError) {
+	v := r.Header.Get(name)
+	if v == "" {
+		return "", invalid("missing " + name + " header")
+	}
+	if len(v) > maxLen {
+		return "", invalid(fmt.Sprintf("%s header is longer than %d characters", name, maxLen))
+	}
+	for i := range len(v) {
+		if v[i] < 0x21 || v[i] > 0x7e {
+			return "", invalid(name + " header must be printable ASCII with no spaces")
+		}
+	}
+	return v, nil
+}
+
+// requestHash is the SHA-256 of the parsed body re-encoded by encoding/json,
+// which writes struct fields in declaration order with no whitespace. So
+// formatting and field order in the client's JSON do not count as a
+// different request (ADR-0001 §The create transaction), and a field added to
+// createRequest later is part of the hash automatically.
+func requestHash(body createRequest) ([]byte, error) {
+	canonical, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encode canonical body: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return sum[:], nil
 }
 
 // newInstanceID returns "inst_" plus 128 random bits (base32, lower case).

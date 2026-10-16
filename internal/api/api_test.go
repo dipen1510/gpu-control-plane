@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,21 +26,25 @@ import (
 
 // fakeStore records calls and returns canned results.
 type fakeStore struct {
-	createCalls []store.CreateRequest
-	createErr   error
-	getInst     store.Instance
-	getErr      error
+	createCalls  []store.CreateRequest
+	createErr    error
+	createResult *store.CreateResult // if set, returned instead of a fresh instance
+	getInst      store.Instance
+	getErr       error
 }
 
-func (f *fakeStore) Create(_ context.Context, req store.CreateRequest) (store.Instance, error) {
+func (f *fakeStore) Create(_ context.Context, req store.CreateRequest) (store.CreateResult, error) {
 	f.createCalls = append(f.createCalls, req)
 	if f.createErr != nil {
-		return store.Instance{}, f.createErr
+		return store.CreateResult{}, f.createErr
 	}
-	return store.Instance{
+	if f.createResult != nil {
+		return *f.createResult, nil
+	}
+	return store.CreateResult{Instance: store.Instance{
 		ID: req.ID, TenantID: req.TenantID, GPUType: req.GPUType, GPUCount: req.GPUCount,
 		NodeID: "node-0001", State: statemachine.Scheduled, ResourceVersion: 1,
-	}, nil
+	}}, nil
 }
 
 func (f *fakeStore) Get(context.Context, string, string) (store.Instance, error) {
@@ -87,6 +92,19 @@ func TestCreateValidation(t *testing.T) {
 		{name: "unknown field", tenant: "t1", key: "k1", body: `{"gpu_type":"H100","gpu_count":2,"region":"x"}`, wantStatus: http.StatusBadRequest},
 		{name: "trailing data", tenant: "t1", key: "k1", body: valid + `{}`, wantStatus: http.StatusBadRequest},
 		{name: "array body", tenant: "t1", key: "k1", body: `[1]`, wantStatus: http.StatusBadRequest},
+		// Header limits: both values go into primary keys, whose btree
+		// entries are capped by Postgres; too long must be 400, not 500.
+		{name: "tenant at 64 chars", tenant: strings.Repeat("t", 64), key: "k1", body: valid, wantStatus: http.StatusAccepted},
+		{name: "tenant at 65 chars", tenant: strings.Repeat("t", 65), key: "k1", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "tenant 6 KB", tenant: strings.Repeat("t", 6<<10), key: "k1", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "tenant with space", tenant: "t 1", key: "k1", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "tenant non-ASCII", tenant: "t\u00e9", key: "k1", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "key at 255 chars", tenant: "t1", key: strings.Repeat("k", 255), body: valid, wantStatus: http.StatusAccepted},
+		{name: "key at 256 chars", tenant: "t1", key: strings.Repeat("k", 256), body: valid, wantStatus: http.StatusBadRequest},
+		{name: "key UUID", tenant: "t1", key: "6f1c2b9e-4a7d-4c2e-9b1a-0d3e5f7a9c1b", body: valid, wantStatus: http.StatusAccepted},
+		{name: "key with tab", tenant: "t1", key: "k\t1", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "key with DEL", tenant: "t1", key: "k\x7f", body: valid, wantStatus: http.StatusBadRequest},
+		{name: "key non-ASCII", tenant: "t1", key: "cl\u00e9", body: valid, wantStatus: http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,6 +166,96 @@ func TestCreateResponse(t *testing.T) {
 	}
 	if etag := rec.Header().Get("ETag"); etag != `"1"` {
 		t.Errorf("ETag = %q, want %q", etag, `"1"`)
+	}
+	if got := rec.Header().Get(headerReplayed); got != "" {
+		t.Errorf("%s = %q on a fresh create, want none", headerReplayed, got)
+	}
+	if len(call.RequestHash) != sha256.Size {
+		t.Errorf("request hash is %d bytes, want %d", len(call.RequestHash), sha256.Size)
+	}
+}
+
+// TestCreateReplayResponse: a replay returns the earlier instance as it is
+// now (not as it was created), with Idempotent-Replayed: true.
+func TestCreateReplayResponse(t *testing.T) {
+	earlier := store.Instance{
+		ID: "inst_earlier", TenantID: "t1", GPUType: "A100", GPUCount: 4,
+		NodeID: "node-0002", State: statemachine.Running, ResourceVersion: 3,
+	}
+	fs := &fakeStore{createResult: &store.CreateResult{Instance: earlier, Replayed: true}}
+	rec := httptest.NewRecorder()
+	newTestHandler(fs).ServeHTTP(rec, newCreateRequest(strings.NewReader(`{"gpu_type":"A100","gpu_count":4}`)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(headerReplayed); got != "true" {
+		t.Errorf("%s = %q, want %q", headerReplayed, got, "true")
+	}
+	if etag := rec.Header().Get("ETag"); etag != `"3"` {
+		t.Errorf("ETag = %q, want %q", etag, `"3"`)
+	}
+	var got instanceResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if want := toResponse(earlier); got != want {
+		t.Errorf("body = %+v, want %+v", got, want)
+	}
+}
+
+// TestRequestHashIsCanonical: the hash the handler passes to the store
+// depends on the parsed values only, not on whitespace or field order.
+func TestRequestHashIsCanonical(t *testing.T) {
+	hashOf := func(t *testing.T, body string) []byte {
+		t.Helper()
+		fs := &fakeStore{}
+		rec := httptest.NewRecorder()
+		newTestHandler(fs).ServeHTTP(rec, newCreateRequest(strings.NewReader(body)))
+		if rec.Code != http.StatusAccepted || len(fs.createCalls) != 1 {
+			t.Fatalf("body %s: status %d, %d store calls; want 202 and 1", body, rec.Code, len(fs.createCalls))
+		}
+		return fs.createCalls[0].RequestHash
+	}
+	base := hashOf(t, `{"gpu_type":"H100","gpu_count":2}`)
+	for _, tc := range []struct {
+		name, body string
+		same       bool
+	}{
+		{name: "whitespace", body: "{ \"gpu_type\" : \"H100\",\n\t\"gpu_count\": 2 }\n", same: true},
+		{name: "field order", body: `{"gpu_count":2,"gpu_type":"H100"}`, same: true},
+		{name: "other count", body: `{"gpu_type":"H100","gpu_count":4}`, same: false},
+		{name: "other type", body: `{"gpu_type":"A100","gpu_count":2}`, same: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hashOf(t, tc.body); bytes.Equal(got, base) != tc.same {
+				t.Errorf("hash(%s) equal to base = %v, want %v", tc.body, !tc.same, tc.same)
+			}
+		})
+	}
+}
+
+func TestGetHeaderLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name, tenant string
+		wantStatus   int
+	}{
+		{name: "tenant at 64 chars", tenant: strings.Repeat("t", 64), wantStatus: http.StatusOK},
+		{name: "tenant at 65 chars", tenant: strings.Repeat("t", 65), wantStatus: http.StatusBadRequest},
+		{name: "tenant with control char", tenant: "t\x01", wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/instances/inst_x", nil)
+			req.Header.Set(headerTenant, tc.tenant)
+			rec := httptest.NewRecorder()
+			newTestHandler(&fakeStore{getInst: store.Instance{ID: "inst_x", ResourceVersion: 1}}).ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus == http.StatusBadRequest && decodeError(t, rec).Code != codeInvalidRequest {
+				t.Errorf("body %s, want invalid_request", rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -255,6 +363,11 @@ func TestCreateStoreErrorMapping(t *testing.T) {
 			wantStatus: http.StatusServiceUnavailable, wantCode: codeInsufficientCapacity, wantRetryAfter: "30",
 		},
 		{
+			name:       "idempotency key reused",
+			err:        fmt.Errorf("create instance inst_x: key used by instance inst_y: %w", store.ErrIdempotencyKeyReused),
+			wantStatus: http.StatusConflict, wantCode: codeKeyReused,
+		},
+		{
 			name:       "other error",
 			err:        errors.New("connection refused"),
 			wantStatus: http.StatusInternalServerError, wantCode: codeInternal,
@@ -276,10 +389,11 @@ func TestCreateStoreErrorMapping(t *testing.T) {
 			if ra := rec.Header().Get("Retry-After"); ra != tc.wantRetryAfter {
 				t.Errorf("Retry-After = %q, want %q", ra, tc.wantRetryAfter)
 			}
-			if tc.wantStatus != http.StatusInternalServerError && !strings.Contains(got.Message, "A100") {
+			if (tc.wantStatus == http.StatusForbidden || tc.wantStatus == http.StatusServiceUnavailable) &&
+				!strings.Contains(got.Message, "A100") {
 				t.Errorf("message %q does not name the gpu_type A100", got.Message)
 			}
-			if strings.Contains(got.Message, "inst_x") || strings.Contains(got.Message, "connection refused") {
+			if strings.Contains(got.Message, "inst_") || strings.Contains(got.Message, "connection refused") {
 				t.Errorf("message %q leaks the store error", got.Message)
 			}
 		})

@@ -5,8 +5,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +34,9 @@ var (
 	// so callers of the store need not import the scheduler. It is the same
 	// value, so errors.Is matches either name.
 	ErrInsufficientCapacity = scheduler.ErrInsufficientCapacity
+	// ErrIdempotencyKeyReused means the tenant already used this
+	// Idempotency-Key for a create with a different body (invariant 2).
+	ErrIdempotencyKeyReused = errors.New("idempotency key reused with a different request")
 )
 
 // EventInstanceScheduled is the outbox event type written by Create.
@@ -89,16 +94,33 @@ type CreateRequest struct {
 	GPUType  string
 	GPUCount int
 
-	// IdempotencyKey and RequestHash are carried for S1-8, which inserts
-	// them into idempotency_keys as step 1 of the same transaction. Create
-	// does not use them yet.
+	// IdempotencyKey is the client's key, scoped to TenantID. Required.
 	IdempotencyKey string
-	RequestHash    []byte
+	// RequestHash is the SHA-256 of the canonical request body, computed by
+	// the caller (ADR-0001: before the transaction). Required. A replay with
+	// a different hash is ErrIdempotencyKeyReused.
+	RequestHash []byte
+}
+
+// CreateResult is what Create returns. Instance is embedded so callers can
+// read result.ID, result.State, ... directly.
+type CreateResult struct {
+	Instance
+	// Replayed is true when the key was already used with the same body:
+	// nothing was written and Instance is the earlier instance as it is
+	// now. A fresh create has Replayed false. Callers that act on a new
+	// instance (the M1 lifecycle driver, S1-14) must skip replays.
+	Replayed bool
 }
 
 // Create runs the create transaction (ADR-0001 §The create transaction):
 //
-//  1. (S1-8) idempotency key
+//  1. INSERT the idempotency key ON CONFLICT DO NOTHING. If the key exists
+//     the transaction rolls back without touching quota or nodes, and
+//     Create returns the earlier instance (same hash, Replayed true) or
+//     ErrIdempotencyKeyReused (different hash). If a concurrent create
+//     holds the same key uncommitted, the INSERT waits for it: if it
+//     commits we replay it, if it rolls back our INSERT goes ahead.
 //  2. reserve quota: tenant_quota row, created at the default limit if missing,
 //     used += n only if it stays within quota_limit
 //  3. scheduler.Place: reserve n GPUs on one node
@@ -109,33 +131,56 @@ type CreateRequest struct {
 // nodes → instances → outbox) so two creates can never deadlock. Any error
 // rolls the whole transaction back: no quota, no GPUs, no row, no event.
 //
-// It returns ErrQuotaExceeded or ErrInsufficientCapacity (wrapped) when the
-// request cannot be satisfied.
-func (s *Store) Create(ctx context.Context, req CreateRequest) (Instance, error) {
+// Because the key row is part of the same transaction, a create that fails
+// (403, 503, any error) leaves no key behind and the same key can be retried
+// later (ADR-0001 Q2).
+//
+// It returns ErrQuotaExceeded, ErrInsufficientCapacity or
+// ErrIdempotencyKeyReused (wrapped) when the request cannot be satisfied.
+func (s *Store) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
+	if req.IdempotencyKey == "" {
+		return CreateResult{}, fmt.Errorf("create instance %s: idempotency key is required", req.ID)
+	}
+	if len(req.RequestHash) != sha256.Size {
+		return CreateResult{}, fmt.Errorf("create instance %s: request hash is %d bytes, want %d",
+			req.ID, len(req.RequestHash), sha256.Size)
+	}
+
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: begin: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: begin: %w", req.ID, err)
 	}
 	// Rollback after a successful Commit returns ErrTxClosed; nothing to undo.
+	// On a replay this rollback is the documented "read it, ROLLBACK".
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	// Step 1 (S1-8) goes here: INSERT INTO idempotency_keys first, so a
-	// duplicate stops before it locks quota or nodes.
+	// Step 1 comes first so a duplicate stops before it locks quota or nodes.
+	inserted, err := claimKey(ctx, tx, req)
+	if err != nil {
+		return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+	}
+	if !inserted {
+		inst, err := replay(ctx, tx, req)
+		if err != nil {
+			return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+		}
+		return CreateResult{Instance: inst, Replayed: true}, nil
+	}
 
 	if err := reserveQuota(ctx, tx, req.TenantID, req.GPUType, req.GPUCount); err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
 	}
 
 	node, err := s.placer.Place(ctx, tx, scheduler.Request{
 		TenantID: req.TenantID, GPUType: req.GPUType, GPUCount: req.GPUCount,
 	})
 	if err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
 	}
 
 	if s.afterPlace != nil {
 		if err := s.afterPlace(ctx, tx); err != nil {
-			return Instance{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+			return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
 		}
 	}
 
@@ -147,24 +192,33 @@ func (s *Store) Create(ctx context.Context, req CreateRequest) (Instance, error)
 		inst.ID, inst.TenantID, inst.GPUType, inst.GPUCount, inst.NodeID,
 		string(inst.State), inst.ResourceVersion,
 	).Scan(&inst.CreatedAt, &inst.UpdatedAt); err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: insert instance: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: insert instance: %w", req.ID, err)
 	}
 
 	if err := insertOutbox(ctx, tx, EventInstanceScheduled, inst); err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: %w", req.ID, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return Instance{}, fmt.Errorf("create instance %s: commit: %w", req.ID, err)
+		return CreateResult{}, fmt.Errorf("create instance %s: commit: %w", req.ID, err)
 	}
-	return inst, nil
+	return CreateResult{Instance: inst}, nil
 }
 
 // Get returns the instance with id owned by tenantID, or ErrNotFound.
 func (s *Store) Get(ctx context.Context, tenantID, id string) (Instance, error) {
+	return selectInstance(ctx, s.db, tenantID, id)
+}
+
+// rowQuerier is satisfied by both DB and pgx.Tx.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func selectInstance(ctx context.Context, q rowQuerier, tenantID, id string) (Instance, error) {
 	var inst Instance
 	var state string
-	err := s.db.QueryRow(ctx, getInstanceSQL, id, tenantID).Scan(
+	err := q.QueryRow(ctx, getInstanceSQL, id, tenantID).Scan(
 		&inst.ID, &inst.TenantID, &inst.GPUType, &inst.GPUCount, &inst.NodeID, &state,
 		&inst.ResourceVersion, &inst.FailureReason, &inst.CreatedAt, &inst.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -174,6 +228,50 @@ func (s *Store) Get(ctx context.Context, tenantID, id string) (Instance, error) 
 		return Instance{}, fmt.Errorf("get instance %s: %w", id, err)
 	}
 	inst.State = statemachine.State(state)
+	return inst, nil
+}
+
+// claimKeySQL is step 1. The primary key (tenant_id, key) makes a second
+// INSERT of the same key wait for the first transaction to finish; then it
+// does nothing if that one committed, or inserts if it rolled back.
+// instance_id points at a row inserted later in this transaction; the FK is
+// DEFERRABLE INITIALLY DEFERRED, so it is checked at COMMIT.
+const claimKeySQL = `
+INSERT INTO idempotency_keys (tenant_id, key, request_hash, instance_id)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (tenant_id, key) DO NOTHING`
+
+const readKeySQL = `
+SELECT request_hash, instance_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2`
+
+// claimKey inserts the key and reports whether it was new.
+func claimKey(ctx context.Context, tx pgx.Tx, req CreateRequest) (bool, error) {
+	tag, err := tx.Exec(ctx, claimKeySQL, req.TenantID, req.IdempotencyKey, req.RequestHash, req.ID)
+	if err != nil {
+		return false, fmt.Errorf("insert idempotency key: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// replay handles a key that already exists: same request hash → the earlier
+// instance as it is now; different hash → ErrIdempotencyKeyReused. It writes
+// nothing. Under READ COMMITTED this statement takes a fresh snapshot, so it
+// sees the row of the transaction claimKey waited for.
+func replay(ctx context.Context, tx pgx.Tx, req CreateRequest) (Instance, error) {
+	var hash []byte
+	var instanceID string
+	if err := tx.QueryRow(ctx, readKeySQL, req.TenantID, req.IdempotencyKey).Scan(&hash, &instanceID); err != nil {
+		// No rows here would mean the key was deleted between the two
+		// statements; M1 never deletes keys, so this is an internal error.
+		return Instance{}, fmt.Errorf("read idempotency key: %w", err)
+	}
+	if !bytes.Equal(hash, req.RequestHash) {
+		return Instance{}, fmt.Errorf("key used by instance %s: %w", instanceID, ErrIdempotencyKeyReused)
+	}
+	inst, err := selectInstance(ctx, tx, req.TenantID, instanceID)
+	if err != nil {
+		return Instance{}, fmt.Errorf("replay: %w", err)
+	}
 	return inst, nil
 }
 

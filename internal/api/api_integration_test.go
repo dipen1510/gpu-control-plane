@@ -433,3 +433,192 @@ func TestQuotaIsPerGPUType(t *testing.T) {
 		t.Errorf("used = %v, want t1/H100 16 and t1/A100 8", w.used)
 	}
 }
+
+// postInstance sends a create and decodes a 202 body (zero otherwise).
+func postInstance(t *testing.T, srv *httptest.Server, tenant, key, body string) (*http.Response, instanceResponse) {
+	t.Helper()
+	resp, b := do(t, http.MethodPost, srv.URL+"/v1/instances",
+		map[string]string{headerTenant: tenant, headerIdempotencyKey: key}, body)
+	var inst instanceResponse
+	if resp.StatusCode == http.StatusAccepted {
+		if err := json.Unmarshal(b, &inst); err != nil {
+			t.Fatalf("decode create body %s: %v", b, err)
+		}
+	}
+	return resp, inst
+}
+
+func TestIdempotentReplay(t *testing.T) {
+	srv, db := newServer(t)
+	const body = `{"gpu_type":"H100","gpu_count":4}`
+	resp, first := postInstance(t, srv, "t1", "k1", body)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("first create: status %d, want 202", resp.StatusCode)
+	}
+	if got := resp.Header.Get(headerReplayed); got != "" {
+		t.Errorf("first create %s = %q, want none", headerReplayed, got)
+	}
+	before := readWrites(t, db)
+
+	resp, again := postInstance(t, srv, "t1", "k1", body)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("replay: status %d, want 202", resp.StatusCode)
+	}
+	if got := resp.Header.Get(headerReplayed); got != "true" {
+		t.Errorf("replay %s = %q, want %q", headerReplayed, got, "true")
+	}
+	if again != first {
+		t.Errorf("replay body = %+v, want the first create's %+v", again, first)
+	}
+
+	// Nothing new: 1 instance, 1 event (no lifecycle rerun), 1 key, quota
+	// and GPUs counted once.
+	after := readWrites(t, db)
+	assertNothingWritten(t, before, after)
+	var scheduled int
+	if err := db.QueryRow(t.Context(),
+		`SELECT count(*) FROM outbox WHERE event_type = 'instance.scheduled'`).Scan(&scheduled); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if after.instances != 1 || scheduled != 1 || after.keys != 1 || after.used["t1/H100"] != 4 {
+		t.Errorf("instances %d, instance.scheduled %d, keys %d, used %d; want 1, 1, 1, 4",
+			after.instances, scheduled, after.keys, after.used["t1/H100"])
+	}
+
+	// A replay reports the instance's current state, not the state at create.
+	if _, err := db.Exec(t.Context(), `UPDATE instances
+		SET state = 'RUNNING', resource_version = 3 WHERE id = $1`, first.ID); err != nil {
+		t.Fatalf("advance instance: %v", err)
+	}
+	resp, later := postInstance(t, srv, "t1", "k1", body)
+	if resp.StatusCode != http.StatusAccepted || resp.Header.Get(headerReplayed) != "true" {
+		t.Fatalf("second replay: status %d %s %q, want 202 true", resp.StatusCode,
+			headerReplayed, resp.Header.Get(headerReplayed))
+	}
+	if stored := storedInstance(t, db, first.ID); later != stored || later.State != "RUNNING" {
+		t.Errorf("second replay body = %+v, want current %+v (RUNNING)", later, stored)
+	}
+	if etag := resp.Header.Get("ETag"); etag != `"3"` {
+		t.Errorf("second replay ETag = %q, want %q", etag, `"3"`)
+	}
+}
+
+func TestIdempotentReplayIgnoresFormatting(t *testing.T) {
+	srv, db := newServer(t)
+	_, first := postInstance(t, srv, "t1", "k1", `{"gpu_type":"A100","gpu_count":2}`)
+	before := readWrites(t, db)
+
+	resp, again := postInstance(t, srv, "t1", "k1", "{\n  \"gpu_count\" : 2,\n\t\"gpu_type\":\"A100\"\n}\n")
+	if resp.StatusCode != http.StatusAccepted || resp.Header.Get(headerReplayed) != "true" {
+		t.Fatalf("reformatted replay: status %d %s %q, want 202 true", resp.StatusCode,
+			headerReplayed, resp.Header.Get(headerReplayed))
+	}
+	if again.ID != first.ID {
+		t.Errorf("replay id = %s, want %s", again.ID, first.ID)
+	}
+	assertNothingWritten(t, before, readWrites(t, db))
+}
+
+func TestIdempotencyKeyReused(t *testing.T) {
+	srv, db := newServer(t)
+	const body = `{"gpu_type":"H100","gpu_count":2}`
+	_, first := postInstance(t, srv, "t1", "k1", body)
+	before := readWrites(t, db)
+
+	for _, other := range []string{
+		`{"gpu_type":"H100","gpu_count":4}`,
+		`{"gpu_type":"A100","gpu_count":2}`,
+	} {
+		resp, e := postCreate(t, srv, "t1", "k1", other)
+		if resp.StatusCode != http.StatusConflict || e.Code != codeKeyReused {
+			t.Errorf("body %s: status %d error %+v, want 409 %s", other, resp.StatusCode, e, codeKeyReused)
+		}
+	}
+	assertNothingWritten(t, before, readWrites(t, db))
+
+	// The key still belongs to the first request.
+	resp, again := postInstance(t, srv, "t1", "k1", body)
+	if resp.StatusCode != http.StatusAccepted || again.ID != first.ID {
+		t.Errorf("original body after 409: status %d id %s, want 202 %s", resp.StatusCode, again.ID, first.ID)
+	}
+}
+
+func TestIdempotencyKeyScopedToTenant(t *testing.T) {
+	srv, db := newServer(t)
+	const body = `{"gpu_type":"H100","gpu_count":1}`
+	_, a := postInstance(t, srv, "t1", "k1", body)
+	resp, b := postInstance(t, srv, "t2", "k1", body)
+	if resp.StatusCode != http.StatusAccepted || resp.Header.Get(headerReplayed) != "" {
+		t.Fatalf("t2 create: status %d %s %q, want a fresh 202", resp.StatusCode,
+			headerReplayed, resp.Header.Get(headerReplayed))
+	}
+	if a.ID == "" || a.ID == b.ID {
+		t.Errorf("t1 id %q, t2 id %q, want two different instances", a.ID, b.ID)
+	}
+	w := readWrites(t, db)
+	if w.instances != 2 || w.keys != 2 || w.used["t1/H100"] != 1 || w.used["t2/H100"] != 1 {
+		t.Errorf("instances %d keys %d used %v, want 2, 2, 1 each", w.instances, w.keys, w.used)
+	}
+	// Each tenant still only sees its own instance.
+	if resp, _ := do(t, http.MethodGet, srv.URL+"/v1/instances/"+a.ID,
+		map[string]string{headerTenant: "t2"}, ""); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("t2 GET of t1's instance: status %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestFailedCreateDoesNotKeepKey: a refused create rolls its key back, so
+// the same key works once the reason goes away (ADR-0001 Q2).
+func TestFailedCreateDoesNotKeepKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		block      string // SQL that makes the create fail
+		unblock    string // SQL that removes the reason
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "503 then capacity frees",
+			block:      `UPDATE nodes SET allocated = capacity WHERE gpu_type = 'A100'`,
+			unblock:    `UPDATE nodes SET allocated = 0 WHERE gpu_type = 'A100'`,
+			wantStatus: http.StatusServiceUnavailable, wantCode: codeInsufficientCapacity,
+		},
+		{
+			name:       "403 then quota frees",
+			block:      `INSERT INTO tenant_quota (tenant_id, gpu_type, used) VALUES ('t1', 'A100', 16)`,
+			unblock:    `UPDATE tenant_quota SET used = 0 WHERE tenant_id = 't1' AND gpu_type = 'A100'`,
+			wantStatus: http.StatusForbidden, wantCode: codeQuotaExceeded,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, db := newServer(t)
+			const body = `{"gpu_type":"A100","gpu_count":2}`
+			if _, err := db.Exec(t.Context(), tc.block); err != nil {
+				t.Fatalf("block: %v", err)
+			}
+
+			resp, e := postCreate(t, srv, "t1", "k1", body)
+			if resp.StatusCode != tc.wantStatus || e.Code != tc.wantCode {
+				t.Fatalf("status %d error %+v, want %d %s", resp.StatusCode, e, tc.wantStatus, tc.wantCode)
+			}
+			if w := readWrites(t, db); w.keys != 0 {
+				t.Fatalf("idempotency_keys has %d rows after a refused create, want 0", w.keys)
+			}
+
+			if _, err := db.Exec(t.Context(), tc.unblock); err != nil {
+				t.Fatalf("unblock: %v", err)
+			}
+			resp, inst := postInstance(t, srv, "t1", "k1", body)
+			if resp.StatusCode != http.StatusAccepted || resp.Header.Get(headerReplayed) != "" {
+				t.Fatalf("retry: status %d %s %q, want a fresh 202", resp.StatusCode,
+					headerReplayed, resp.Header.Get(headerReplayed))
+			}
+			if inst.State != "SCHEDULED" || inst.ResourceVersion != 1 {
+				t.Errorf("retry created %+v, want SCHEDULED rv 1", inst)
+			}
+			if w := readWrites(t, db); w.instances != 1 || w.keys != 1 {
+				t.Errorf("instances %d keys %d, want 1, 1", w.instances, w.keys)
+			}
+		})
+	}
+}

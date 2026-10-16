@@ -63,7 +63,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Done |
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Done |
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Done |
-| S1-8 | 2 | Idempotent create | implementer | S1-6 | Proposed |
+| S1-8 | 2 | Idempotent create | implementer | S1-6 | Done |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Proposed |
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Proposed |
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
@@ -241,7 +241,11 @@ Acceptance:
 Out of scope: configurable quota limits; queueing (v2)
 
 ### S1-8 (2 pts) — Idempotent create
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Notes: store.Create returns CreateResult{Instance, Replayed}; S1-14's driver must run only when
+Replayed is false. Header limits: X-Tenant-ID ≤ 64, Idempotency-Key ≤ 255, visible ASCII (no spaces).
+Follow-ups from review: S1-12 should use a larger pool (test pool is 4 conns on 2 CPUs) so races
+are real; a key whose instance is missing returns 500 (impossible in M1; mind it in M2 cleanup).
 Why: retried POSTs must never double-provision GPUs or double-charge quota (invariant 2)
 Design link: ADR-0001 §The create transaction step 1, §M1-b
 Depends on: S1-6
