@@ -62,7 +62,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Done |
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Done |
-| S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Proposed |
+| S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Done |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Proposed |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Proposed |
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Proposed |
@@ -223,7 +223,11 @@ Out of scope: 403/503 (S1-7), idempotency replay (S1-8), DELETE (S1-10), GET sho
 RUNNING after create (S1-14)
 
 ### S1-7 (1 pt) — Create fails cleanly: quota 403, capacity 503
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Follow-ups from review: ADR-0001 §API error column should list 413 request_too_large and 408
+request_timeout; fixed "malformed JSON body" hides which field was wrong (a later story could name
+the field safely); add a string-lookalike error case to TestCreateStoreErrorMapping; grammar
+"1 free A100 GPUs".
 Why: clients must tell "you are not allowed" (do not retry) apart from "try again later"
 Design link: ADR-0001 §API (M1), §The create transaction steps 2–3; Discussion D2, D3
 Depends on: S1-6

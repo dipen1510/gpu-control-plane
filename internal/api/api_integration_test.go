@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -240,5 +241,195 @@ func TestGetOtherTenantIs404(t *testing.T) {
 	resp, b := do(t, http.MethodGet, srv.URL+"/v1/instances/"+created.ID, map[string]string{headerTenant: "t1"}, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("owner GET: status %d body %s, want 200", resp.StatusCode, b)
+	}
+}
+
+// writes is everything a create writes; a rejected create must change none of it.
+type writes struct {
+	instances, events, keys int
+	allocated               map[string]int // node id → allocated
+	used                    map[string]int // "tenant/gpu_type" → used
+}
+
+func readWrites(t *testing.T, db *pgxpool.Pool) writes {
+	t.Helper()
+	w := writes{allocated: map[string]int{}, used: map[string]int{}}
+	if err := db.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM instances), (SELECT count(*) FROM outbox), (SELECT count(*) FROM idempotency_keys)`).
+		Scan(&w.instances, &w.events, &w.keys); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	rows, err := db.Query(t.Context(), `SELECT id, allocated FROM nodes`)
+	if err != nil {
+		t.Fatalf("read nodes: %v", err)
+	}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			t.Fatalf("scan node: %v", err)
+		}
+		w.allocated[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read nodes: %v", err)
+	}
+	rows, err = db.Query(t.Context(), `SELECT tenant_id || '/' || gpu_type, used FROM tenant_quota`)
+	if err != nil {
+		t.Fatalf("read quota: %v", err)
+	}
+	for rows.Next() {
+		var k string
+		var n int
+		if err := rows.Scan(&k, &n); err != nil {
+			t.Fatalf("scan quota: %v", err)
+		}
+		w.used[k] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read quota: %v", err)
+	}
+	return w
+}
+
+func assertNothingWritten(t *testing.T, before, after writes) {
+	t.Helper()
+	if after.instances != before.instances || after.events != before.events || after.keys != before.keys {
+		t.Errorf("instances/outbox/idempotency_keys went from %d/%d/%d to %d/%d/%d, want unchanged",
+			before.instances, before.events, before.keys, after.instances, after.events, after.keys)
+	}
+	if !maps.Equal(before.allocated, after.allocated) {
+		t.Errorf("nodes.allocated went from %v to %v, want unchanged", before.allocated, after.allocated)
+	}
+	if !maps.Equal(before.used, after.used) {
+		t.Errorf("tenant_quota.used went from %v to %v, want unchanged", before.used, after.used)
+	}
+}
+
+// postCreate sends a create and decodes the error envelope (zero if none).
+func postCreate(t *testing.T, srv *httptest.Server, tenant, key, body string) (*http.Response, errorDetail) {
+	t.Helper()
+	resp, b := do(t, http.MethodPost, srv.URL+"/v1/instances",
+		map[string]string{headerTenant: tenant, headerIdempotencyKey: key}, body)
+	var e errorBody
+	if resp.StatusCode != http.StatusAccepted {
+		if err := json.Unmarshal(b, &e); err != nil {
+			t.Fatalf("status %d body %s is not the error envelope: %v", resp.StatusCode, b, err)
+		}
+	}
+	return resp, e.Error
+}
+
+// TestCreateQuotaExceeded: the quota row is set directly, and the nodes stay
+// empty, so quota is the only thing that can refuse. If the reserve UPDATE
+// lost its `used + n <= quota_limit` guard, the CHECK constraint would turn
+// the over-quota write into a 500, which this test rejects.
+func TestCreateQuotaExceeded(t *testing.T) {
+	tests := []struct {
+		name  string
+		used  int
+		count int
+	}{
+		{name: "at the limit", used: 16, count: 1},
+		{name: "would cross the limit", used: 12, count: 8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, db := newServer(t)
+			if _, err := db.Exec(t.Context(),
+				`INSERT INTO tenant_quota (tenant_id, gpu_type, used) VALUES ('t1', 'H100', $1)`, tc.used); err != nil {
+				t.Fatalf("set quota: %v", err)
+			}
+			before := readWrites(t, db)
+
+			resp, e := postCreate(t, srv, "t1", "k1", `{"gpu_type":"H100","gpu_count":`+strconv.Itoa(tc.count)+`}`)
+			if resp.StatusCode != http.StatusForbidden || e.Code != codeQuotaExceeded {
+				t.Fatalf("status %d error %+v, want 403 quota_exceeded", resp.StatusCode, e)
+			}
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				t.Errorf("Retry-After = %q on 403, want none (retrying will not help)", ra)
+			}
+			if !strings.Contains(e.Message, "H100") {
+				t.Errorf("message %q does not name the gpu_type", e.Message)
+			}
+			after := readWrites(t, db)
+			assertNothingWritten(t, before, after)
+			if after.used["t1/H100"] != tc.used {
+				t.Errorf("used = %d, want %d", after.used["t1/H100"], tc.used)
+			}
+		})
+	}
+}
+
+func TestCreateInsufficientCapacity(t *testing.T) {
+	srv, db := newServer(t)
+	// t1 already holds 4 A100s, so its quota row exists with used 4; the
+	// failed create must roll back its own reservation of that row.
+	createInstance(t, srv, "t1", "k1", `{"gpu_type":"A100","gpu_count":4}`)
+	// Other tenants fill the rest of the A100 capacity (2 nodes × 8).
+	createInstance(t, srv, "t2", "k1", `{"gpu_type":"A100","gpu_count":8}`)
+	createInstance(t, srv, "t3", "k1", `{"gpu_type":"A100","gpu_count":4}`)
+	before := readWrites(t, db)
+	if before.used["t1/A100"] != 4 {
+		t.Fatalf("setup: t1 A100 used = %d, want 4", before.used["t1/A100"])
+	}
+
+	resp, e := postCreate(t, srv, "t1", "k2", `{"gpu_type":"A100","gpu_count":1}`)
+	if resp.StatusCode != http.StatusServiceUnavailable || e.Code != codeInsufficientCapacity {
+		t.Fatalf("status %d error %+v, want 503 insufficient_capacity", resp.StatusCode, e)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "30" {
+		t.Errorf("Retry-After = %q, want %q", ra, "30")
+	}
+	if !strings.Contains(e.Message, "A100") {
+		t.Errorf("message %q does not name the gpu_type A100", e.Message)
+	}
+	assertNothingWritten(t, before, readWrites(t, db))
+
+	// H100 capacity is untouched, so the same tenant can still get those.
+	createInstance(t, srv, "t1", "k3", `{"gpu_type":"H100","gpu_count":8}`)
+}
+
+// TestCreateFragmentedCapacity: 8 A100s are free in total, but split 4 + 4
+// across two nodes, and an instance must fit on one node (D1).
+func TestCreateFragmentedCapacity(t *testing.T) {
+	srv, db := newServer(t)
+	if _, err := db.Exec(t.Context(), `UPDATE nodes SET allocated = 4 WHERE gpu_type = 'A100'`); err != nil {
+		t.Fatalf("fragment nodes: %v", err)
+	}
+	before := readWrites(t, db)
+
+	resp, e := postCreate(t, srv, "t1", "k1", `{"gpu_type":"A100","gpu_count":8}`)
+	if resp.StatusCode != http.StatusServiceUnavailable || e.Code != codeInsufficientCapacity {
+		t.Fatalf("status %d error %+v, want 503 insufficient_capacity", resp.StatusCode, e)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "30" {
+		t.Errorf("Retry-After = %q, want %q", ra, "30")
+	}
+	assertNothingWritten(t, before, readWrites(t, db))
+
+	// A request that fits one node's free GPUs still succeeds.
+	createInstance(t, srv, "t1", "k2", `{"gpu_type":"A100","gpu_count":4}`)
+}
+
+// TestQuotaIsPerGPUType: a tenant reaches its H100 limit exactly (8 + 8 = 16
+// is allowed), one more H100 is refused, and A100 has its own 16.
+func TestQuotaIsPerGPUType(t *testing.T) {
+	srv, db := newServer(t)
+	createInstance(t, srv, "t1", "k1", `{"gpu_type":"H100","gpu_count":8}`)
+	createInstance(t, srv, "t1", "k2", `{"gpu_type":"H100","gpu_count":8}`)
+
+	resp, e := postCreate(t, srv, "t1", "k3", `{"gpu_type":"H100","gpu_count":1}`)
+	if resp.StatusCode != http.StatusForbidden || e.Code != codeQuotaExceeded {
+		t.Fatalf("17th H100: status %d error %+v, want 403 quota_exceeded", resp.StatusCode, e)
+	}
+
+	inst := createInstance(t, srv, "t1", "k4", `{"gpu_type":"A100","gpu_count":8}`)
+	if inst.GPUType != "A100" {
+		t.Errorf("created %+v, want an A100 instance", inst)
+	}
+	w := readWrites(t, db)
+	if w.used["t1/H100"] != 16 || w.used["t1/A100"] != 8 {
+		t.Errorf("used = %v, want t1/H100 16 and t1/A100 8", w.used)
 	}
 }

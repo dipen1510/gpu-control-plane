@@ -1,15 +1,23 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
@@ -218,4 +226,218 @@ func TestEtagMatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+func newCreateRequest(body io.Reader) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/v1/instances", body)
+	req.Header.Set(headerTenant, "t1")
+	req.Header.Set(headerIdempotencyKey, "k1")
+	return req
+}
+
+func TestCreateStoreErrorMapping(t *testing.T) {
+	tests := []struct {
+		name           string
+		err            error
+		wantStatus     int
+		wantCode       string
+		wantRetryAfter string
+	}{
+		{
+			name: "quota exceeded",
+			// Wrapped the way store.Create wraps it.
+			err:        fmt.Errorf("create instance inst_x: reserve 8 A100 GPUs for tenant t1: %w", store.ErrQuotaExceeded),
+			wantStatus: http.StatusForbidden, wantCode: codeQuotaExceeded,
+		},
+		{
+			name:       "insufficient capacity",
+			err:        fmt.Errorf("create instance inst_x: place 8 A100 GPUs (0 candidates): %w", store.ErrInsufficientCapacity),
+			wantStatus: http.StatusServiceUnavailable, wantCode: codeInsufficientCapacity, wantRetryAfter: "30",
+		},
+		{
+			name:       "other error",
+			err:        errors.New("connection refused"),
+			wantStatus: http.StatusInternalServerError, wantCode: codeInternal,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			newTestHandler(&fakeStore{createErr: tc.err}).ServeHTTP(rec,
+				newCreateRequest(strings.NewReader(`{"gpu_type":"A100","gpu_count":8}`)))
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			got := decodeError(t, rec)
+			if got.Code != tc.wantCode {
+				t.Errorf("code = %q, want %q", got.Code, tc.wantCode)
+			}
+			if ra := rec.Header().Get("Retry-After"); ra != tc.wantRetryAfter {
+				t.Errorf("Retry-After = %q, want %q", ra, tc.wantRetryAfter)
+			}
+			if tc.wantStatus != http.StatusInternalServerError && !strings.Contains(got.Message, "A100") {
+				t.Errorf("message %q does not name the gpu_type A100", got.Message)
+			}
+			if strings.Contains(got.Message, "inst_x") || strings.Contains(got.Message, "connection refused") {
+				t.Errorf("message %q leaks the store error", got.Message)
+			}
+		})
+	}
+}
+
+// errReader fails every Read with err.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// timeoutError is what a read past the connection's deadline returns.
+type timeoutError struct{ msg string }
+
+func (e timeoutError) Error() string   { return e.msg }
+func (e timeoutError) Timeout() bool   { return true }
+func (e timeoutError) Temporary() bool { return true }
+
+func TestCreateBodyErrors(t *testing.T) {
+	const secret = "10.0.0.5:51234"
+	tests := []struct {
+		name        string
+		body        io.Reader
+		wantStatus  int
+		wantCode    string
+		wantMessage string
+	}{
+		{
+			name: "malformed JSON", body: strings.NewReader(`{"gpu_type":`),
+			wantStatus: http.StatusBadRequest, wantCode: codeInvalidRequest, wantMessage: msgMalformedBody,
+		},
+		{
+			name: "wrong type", body: strings.NewReader(`{"gpu_type":"H100","gpu_count":"2"}`),
+			wantStatus: http.StatusBadRequest, wantCode: codeInvalidRequest, wantMessage: msgMalformedBody,
+		},
+		{
+			name: "trailing value", body: strings.NewReader(`{"gpu_type":"H100","gpu_count":2}{}`),
+			wantStatus: http.StatusBadRequest, wantCode: codeInvalidRequest, wantMessage: msgMalformedBody,
+		},
+		{
+			name:       "over the limit inside the object",
+			body:       strings.NewReader(`{"gpu_type":"` + strings.Repeat("x", maxBodyBytes) + `","gpu_count":2}`),
+			wantStatus: http.StatusRequestEntityTooLarge, wantCode: codeRequestTooLarge,
+			wantMessage: "request body exceeds 4096 bytes",
+		},
+		{
+			name:       "over the limit after the object",
+			body:       strings.NewReader(`{"gpu_type":"H100","gpu_count":2}` + strings.Repeat(" ", maxBodyBytes)),
+			wantStatus: http.StatusRequestEntityTooLarge, wantCode: codeRequestTooLarge,
+			wantMessage: "request body exceeds 4096 bytes",
+		},
+		{
+			name:       "read timeout",
+			body:       errReader{&net.OpError{Op: "read", Net: "tcp", Err: timeoutError{"i/o timeout from " + secret}}},
+			wantStatus: http.StatusRequestTimeout, wantCode: codeRequestTimeout, wantMessage: msgBodyTimeout,
+		},
+		{
+			name:       "connection reset mid-body",
+			body:       errReader{&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer " + secret)}},
+			wantStatus: http.StatusBadRequest, wantCode: codeInvalidRequest, wantMessage: msgMalformedBody,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			fs := &fakeStore{}
+			h := NewHandler(fs, slog.New(slog.NewTextHandler(&logs, nil)))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newCreateRequest(tc.body))
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if got := decodeError(t, rec); got.Code != tc.wantCode || got.Message != tc.wantMessage {
+				t.Errorf("error = %+v, want code %q message %q", got, tc.wantCode, tc.wantMessage)
+			}
+			if strings.Contains(rec.Body.String(), secret) {
+				t.Errorf("response %s leaks %s", rec.Body.String(), secret)
+			}
+			// The underlying error is not lost: it is in the log.
+			if !strings.Contains(logs.String(), "create request rejected") || !strings.Contains(logs.String(), "err=") {
+				t.Errorf("log %q does not record the underlying error", logs.String())
+			}
+			if len(fs.createCalls) != 0 {
+				t.Errorf("store.Create called on a bad body")
+			}
+		})
+	}
+}
+
+// pipeListener hands out one in-memory connection, so an http.Server can run
+// inside a synctest bubble where its read deadline uses the fake clock.
+type pipeListener struct {
+	conns chan net.Conn
+	once  sync.Once
+	done  chan struct{}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// TestCreateBodyReadTimeout checks that what net/http really returns when the
+// server's ReadTimeout fires mid-body is classified as 408, not 400.
+func TestCreateBodyReadTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srvConn, cliConn := net.Pipe()
+		ln := &pipeListener{conns: make(chan net.Conn, 1), done: make(chan struct{})}
+		ln.conns <- srvConn
+		srv := &http.Server{Handler: newTestHandler(&fakeStore{}), ReadTimeout: 10 * time.Second}
+		served := make(chan error, 1)
+		go func() { served <- srv.Serve(ln) }()
+
+		// Headers promise 100 bytes, then the client sends 12 and stalls.
+		start := time.Now()
+		if _, err := io.WriteString(cliConn, "POST /v1/instances HTTP/1.1\r\nHost: x\r\n"+
+			headerTenant+": t1\r\n"+headerIdempotencyKey+": k1\r\nContent-Length: 100\r\n\r\n"+
+			`{"gpu_type":`); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(cliConn), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close() // in-memory body; nothing to report
+		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("read body: %v", err)
+		}
+		if resp.StatusCode != http.StatusRequestTimeout {
+			t.Errorf("status = %d body %s, want 408", resp.StatusCode, b)
+		}
+		var e errorBody
+		if err := json.Unmarshal(b, &e); err != nil || e.Error.Code != codeRequestTimeout || e.Error.Message != msgBodyTimeout {
+			t.Errorf("body %s, want request_timeout with the fixed message", b)
+		}
+		if waited := time.Since(start); waited < 10*time.Second {
+			t.Errorf("answered after %v, before the 10s ReadTimeout", waited)
+		}
+
+		_ = cliConn.Close() // in-memory pipe; nothing to report
+		if err := srv.Close(); err != nil {
+			t.Errorf("close server: %v", err)
+		}
+		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve: %v", err)
+		}
+	})
 }

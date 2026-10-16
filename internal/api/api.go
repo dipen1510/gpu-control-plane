@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -33,6 +34,10 @@ const (
 	// maxBodyBytes bounds the create body; a valid one is ~40 bytes.
 	maxBodyBytes = 4 << 10
 
+	// retryAfterSeconds is the Retry-After on 503 insufficient_capacity
+	// (ADR-0001 resolved questions).
+	retryAfterSeconds = "30"
+
 	// requestTimeout bounds the database work of one request, so a slow or
 	// stuck Postgres fails the request instead of piling up goroutines.
 	requestTimeout = 10 * time.Second
@@ -40,9 +45,20 @@ const (
 
 // Error codes in the {"error": {"code", "message"}} envelope.
 const (
-	codeInvalidRequest = "invalid_request"
-	codeNotFound       = "not_found"
-	codeInternal       = "internal"
+	codeInvalidRequest       = "invalid_request"
+	codeRequestTooLarge      = "request_too_large"
+	codeRequestTimeout       = "request_timeout"
+	codeQuotaExceeded        = "quota_exceeded"
+	codeNotFound             = "not_found"
+	codeInsufficientCapacity = "insufficient_capacity"
+	codeInternal             = "internal"
+)
+
+// Fixed messages for body errors. The decoder's own error can include socket
+// addresses or other internals, so it is logged and never sent.
+const (
+	msgMalformedBody = "malformed JSON body"
+	msgBodyTimeout   = "timed out reading the request body"
 )
 
 // D1: one instance per request, fitting on a single node.
@@ -104,9 +120,13 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "missing "+headerIdempotencyKey+" header")
 		return
 	}
-	body, err := decodeCreate(w, r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
+	body, reqErr := decodeCreate(w, r)
+	if reqErr != nil {
+		if reqErr.cause != nil {
+			h.log.Info("create request rejected", "tenant", tenant, "status", reqErr.status,
+				"code", reqErr.code, "err", reqErr.cause)
+		}
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
 
@@ -116,9 +136,25 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		ID: newInstanceID(), TenantID: tenant, GPUType: body.GPUType, GPUCount: body.GPUCount,
 		IdempotencyKey: key, // RequestHash: S1-8
 	})
-	if err != nil {
-		// TODO(S1-7): ErrQuotaExceeded → 403 quota_exceeded,
-		// ErrInsufficientCapacity → 503 insufficient_capacity + Retry-After.
+	switch {
+	case errors.Is(err, store.ErrQuotaExceeded):
+		// 403: retrying will not help until the tenant frees GPUs (D2).
+		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
+			"gpu_count", body.GPUCount, "result", codeQuotaExceeded)
+		writeError(w, http.StatusForbidden, codeQuotaExceeded, fmt.Sprintf(
+			"%s GPU quota exceeded: %d more would go over the tenant's limit", body.GPUType, body.GPUCount))
+		return
+	case errors.Is(err, store.ErrInsufficientCapacity):
+		// 503 + Retry-After: capacity may free up, so the client should
+		// retry later (D3). The message names the GPU type so it can't be
+		// mistaken for a quota error.
+		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
+			"gpu_count", body.GPUCount, "result", codeInsufficientCapacity)
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		writeError(w, http.StatusServiceUnavailable, codeInsufficientCapacity, fmt.Sprintf(
+			"no node has %d free %s GPUs; retry later", body.GPUCount, body.GPUType))
+		return
+	case err != nil:
 		h.internalError(w, "create instance", err, "tenant", tenant,
 			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
 		return
@@ -158,22 +194,58 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	writeInstance(w, http.StatusOK, inst)
 }
 
+// requestError is a client error found before calling the store. message is
+// sent to the client; cause, if set, is the underlying error, which is logged
+// but never sent.
+type requestError struct {
+	status  int
+	code    string
+	message string
+	cause   error
+}
+
+func invalid(message string) *requestError {
+	return &requestError{status: http.StatusBadRequest, code: codeInvalidRequest, message: message}
+}
+
+// bodyError classifies an error from reading or decoding the body: over the
+// size limit → 413, the server's read deadline → 408, anything else (bad
+// JSON, wrong types, client hung up mid-body) → 400. All three carry a fixed
+// message.
+func bodyError(err error) *requestError {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return &requestError{status: http.StatusRequestEntityTooLarge, code: codeRequestTooLarge,
+			message: fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes), cause: err}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &requestError{status: http.StatusRequestTimeout, code: codeRequestTimeout,
+			message: msgBodyTimeout, cause: err}
+	}
+	return &requestError{status: http.StatusBadRequest, code: codeInvalidRequest,
+		message: msgMalformedBody, cause: err}
+}
+
 // decodeCreate parses and validates the create body.
-func decodeCreate(w http.ResponseWriter, r *http.Request) (createRequest, error) {
+func decodeCreate(w http.ResponseWriter, r *http.Request) (createRequest, *requestError) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	var body createRequest
 	if err := dec.Decode(&body); err != nil {
-		return createRequest{}, fmt.Errorf("malformed JSON body: %v", err)
+		return createRequest{}, bodyError(err)
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return createRequest{}, errors.New("malformed JSON body: unexpected data after the object")
+	switch err := dec.Decode(&struct{}{}); {
+	case err == nil:
+		return createRequest{}, bodyError(errors.New("unexpected JSON value after the object"))
+	case !errors.Is(err, io.EOF):
+		return createRequest{}, bodyError(fmt.Errorf("after the object: %w", err))
 	}
 	if !validGPUTypes[body.GPUType] {
-		return createRequest{}, fmt.Errorf("gpu_type must be H100 or A100, got %q", body.GPUType)
+		return createRequest{}, invalid(fmt.Sprintf("gpu_type must be H100 or A100, got %q", body.GPUType))
 	}
 	if !validGPUCounts[body.GPUCount] {
-		return createRequest{}, fmt.Errorf("gpu_count must be 1, 2, 4 or 8, got %d", body.GPUCount)
+		return createRequest{}, invalid(fmt.Sprintf("gpu_count must be 1, 2, 4 or 8, got %d", body.GPUCount))
 	}
 	return body, nil
 }
