@@ -74,7 +74,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Done |
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Done |
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Done |
-| S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
+| S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Done |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Proposed |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
@@ -361,7 +361,12 @@ Acceptance:
 Out of scope: chaos (M4); multiple OS processes
 
 ### S1-12 (2 pts) — Spec tests: idempotency races and state machine
-Owner: test-engineer        Reviewer: verifier        Status: Proposed
+Owner: test-engineer        Reviewer: verifier        Status: Done (verifier review → property-test flake fixed, 2026-10-16)
+Review: all 9 independent mutations caught (outbox in a separate tx before/after commit for Create and
+Transition, check order, hash ignored on replay, extra state-machine edge, double release, CAS dropped).
+CHANGES REQUESTED for a ~10% flake (random creates could exceed a tenant's quota; seed 1059). Fixed by
+making the model predict quota/capacity refusals and assert them (now also covers invariant 6);
+-count=50 clean; racer deadline 15s with fail-fast.
 Why: tests written from the spec, not the code, catch the implementation being wrong
 Design link: ADR-0001 §The create transaction step 1, §Lifecycle transitions
 Depends on: S1-2 (may fail until S1-8 and S1-9 land)
