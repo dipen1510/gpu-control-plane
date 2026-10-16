@@ -64,7 +64,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Done |
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Done |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Done |
-| S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Proposed |
+| S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Done |
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Proposed |
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
@@ -263,7 +263,14 @@ Acceptance:
 Out of scope: key expiry; storing failed responses (ADR-0001 Q2)
 
 ### S1-9 (2 pts) — Lifecycle transitions with resource_version and release
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE on 2nd review, 2026-10-16)
+Review history: implementer found the ADR order (release, then CAS) makes concurrent losers hit
+the used >= 0 CHECK (23514) → changed to lock quota → lock node → CAS on instance → winner releases.
+1st review CHANGES REQUESTED: version must be checked before CanTransition, so a caller that lost a
+race gets ErrStaleVersion (not ErrInvalidTransition) — S1-14/S1-10 rely on it. Fixed; added
+PENDING→FAILED (no release) and a create/release churn test that fails on any 40P01.
+Follow-ups: ADR amendment (A-4); the "refuse to release if the returned row differs" branch has no
+in-repo test; the outbox-outside-tx mutation is still for S1-12.
 Why: the M2 controller will drive every state through this one function; it must be idempotent and release capacity exactly once
 Design link: ADR-0001 §Lifecycle transitions (store.Transition); Discussion D10, D11, D12
 Depends on: S1-1, S1-6
