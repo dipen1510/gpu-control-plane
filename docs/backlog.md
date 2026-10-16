@@ -61,7 +61,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-3 | 1 | Seed fake nodes | implementer | S1-2 | Done |
 | S1-4 | 1 | Node ranking: filter, best fit, tie-break | implementer | — | Done |
 | S1-5 | 2 | Place: atomic reserve with fallback | implementer | S1-2, S1-4 | Done |
-| S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Proposed |
+| S1-6 | 2 | Create (happy path) and get instance | implementer | S1-1, S1-5 | Done |
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Proposed |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Proposed |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Proposed |
@@ -192,7 +192,13 @@ Acceptance:
 Out of scope: quota, instance rows (S1-6)
 
 ### S1-6 (2 pts) — Create (happy path) and get instance
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16; server timeouts + outbox total count fixed before commit)
+Follow-ups from review: S1-7 must make TestCreateQuotaExceeded fail if the quota WHERE is dropped,
+and should return fixed 400/413/408 messages (decoder errors currently leak socket addresses);
+S1-8 should cap X-Tenant-ID / Idempotency-Key length (a ~6 KB tenant id gives 500 from the btree
+limit); S1-12 should add a test that fails if the outbox insert moves outside the transaction;
+S1-14 must update TestCreateHappyPath's total outbox count to the full event list (NOTE in test);
+unmatched routes / wrong methods return plain-text 404/405, not the JSON envelope.
 Why: the core user flow; quota, placement, instance and outbox commit together or not at all
 Design link: ADR-0001 §API (M1), §The create transaction
 Depends on: S1-1, S1-5

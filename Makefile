@@ -9,7 +9,7 @@ DATABASE_URL ?= postgres://gpucp:gpucp@localhost:5432/gpucp?sslmode=disable
 # Fake nodes for `make seed-nodes` (ADR-0001: M1 has no node sync loop).
 N ?= 10
 
-.PHONY: test test-integration lint db-up db-down seed-nodes kind-up kind-down deploy
+.PHONY: test test-integration lint db-up db-down seed-nodes run kind-up kind-down deploy
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -46,6 +46,10 @@ db-up:
 # migrations first. Re-running is safe and never changes `allocated` (D15).
 seed-nodes:
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/seed-nodes -n $(N)
+
+# Run the API server on :8080 against DATABASE_URL (applies migrations first).
+run:
+	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/apiserver
 
 # Stop and remove the container and its data.
 db-down:
