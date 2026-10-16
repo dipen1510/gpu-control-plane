@@ -73,7 +73,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Done |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Done |
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Done |
-| S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
+| S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Done |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Proposed |
@@ -329,7 +329,14 @@ Acceptance:
 Out of scope: Pods and real shutdown delay (M2 controller)
 
 ### S1-11 (2 pts) — Concurrency test: no over-allocation, no over-quota
-Owner: test-engineer        Reviewer: verifier        Status: Proposed
+Owner: test-engineer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Deviation accepted: "own connection per goroutine" is implemented as 4 independent replicas (own
+pool/store/scheduler/driver/server, 8 conns each) sharing one Postgres — real contention within the
+100-connection limit. Deadlock (no-savepoint) shape caught only ~1/10 here; TestPlaceReleasesLockOnLostRace
+is the reliable guard (10/10).
+Follow-ups from review: map 40P01 to 503 (ADR says so; today 500) — S1-13 or a small story; add
+`-p 2` (or smaller pools) to test-integration so many-core CI can't exceed max_connections; assert the
+churn race actually happened (cut > 0); soften the one_free_on_ten_nodes comment.
 Why: these races only show up under real parallel load; this test is the proof for invariants 1 and 6 with N replicas
 Design link: ADR-0001 §Failure modes, §Invariants this design protects
 Depends on: S1-2 (may fail until S1-7 lands)
