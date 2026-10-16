@@ -70,8 +70,9 @@ docs/backlog.md every story and its status
 
 | Command | What it does |
 |---|---|
-| `make test` | `go test -race -count=1 ./...` |
-| `make lint` | `go vet` + `staticcheck` (+ `golangci-lint` if installed) |
+| `make test` | `go test -race -count=1 ./...` (no DB needed) |
+| `make test-integration` | needs `make db-up`; `-race -p 2 -tags=integration` against `DATABASE_URL` |
+| `make lint` | `gofmt` check + `go vet` + `staticcheck` (plain and `-tags=integration`); fails on any finding |
 | `make kind-up` / `make kind-down` | create / delete the local cluster |
 | `make deploy` | build images, load into kind, helm upgrade (added in Milestone 2) |
 

@@ -4,7 +4,9 @@ GO      ?= go
 # Local Postgres for integration tests (ADR-0001 M1-d).
 PG_CONTAINER ?= gpucp-postgres
 PG_IMAGE     ?= postgres:16
-DATABASE_URL ?= postgres://gpucp:gpucp@localhost:5432/gpucp?sslmode=disable
+# 127.0.0.1, not localhost: localhost may resolve to ::1 first and miss the
+# container's IPv4 port mapping, and matches pg_isready below.
+DATABASE_URL ?= postgres://gpucp:gpucp@127.0.0.1:5432/gpucp?sslmode=disable
 
 # Fake nodes for `make seed-nodes` (ADR-0001: M1 has no node sync loop).
 N ?= 10
@@ -15,14 +17,28 @@ test:
 	$(GO) test -race -count=1 ./...
 
 # Needs a running Postgres: `make db-up` first.
+# -p 2 caps how many test binaries run at once. Each package's tests open their
+# own pools against one Postgres (max_connections=100); with the default
+# -p=GOMAXPROCS a many-core CI box could run enough packages in parallel to
+# exhaust connections and fail with "too many clients" instead of a real bug.
 test-integration:
-	DATABASE_URL='$(DATABASE_URL)' $(GO) test -race -count=1 -tags=integration ./...
+	DATABASE_URL='$(DATABASE_URL)' $(GO) test -race -count=1 -p 2 -tags=integration ./...
+
+# Every step must be able to fail the build: a lint step that can't fail
+# checks nothing. golangci-lint is deliberately not run: we enable no linters
+# beyond vet + staticcheck, and binaries built with an older Go refuse this
+# Go 1.26 module.
+STATICCHECK_INSTALL := go install honnef.co/go/tools/cmd/staticcheck@latest
 
 lint:
+	@unformatted="$$(gofmt -l .)"; if [ -n "$$unformatted" ]; then \
+		echo "gofmt needed on:" >&2; echo "$$unformatted" >&2; exit 1; fi
 	$(GO) vet ./...
 	$(GO) vet -tags=integration ./...
-	@command -v staticcheck >/dev/null 2>&1 && staticcheck ./... || echo "staticcheck not installed: go install honnef.co/go/tools/cmd/staticcheck@latest"
-	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run ./... || true
+	@command -v staticcheck >/dev/null 2>&1 || { \
+		echo "staticcheck not installed; install with: $(STATICCHECK_INSTALL)" >&2; exit 1; }
+	staticcheck ./...
+	staticcheck -tags=integration ./...
 
 # Start (or restart) the Postgres 16 container and wait until it accepts TCP
 # connections. The image's init phase runs a socket-only server first, so

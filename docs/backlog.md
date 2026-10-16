@@ -76,7 +76,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Done |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Done |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
-| S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Proposed |
+| S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Done |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
@@ -84,7 +84,13 @@ the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
 
 ### S1-15 (1 pt) — `make lint` fails on real lint errors
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Result: lint = gofmt check + go vet + staticcheck, each plain and with -tags=integration; any finding
+or missing staticcheck fails. golangci-lint removed (no extra linters enabled; can't run on Go 1.26).
+test-integration runs with -p 2 (closes the S1-11 max_connections follow-up). DATABASE_URL default
+is 127.0.0.1 (localhost may resolve to ::1 and miss the container's IPv4 port).
+Deviations (pending tech-lead OK): gofmt check added. Follow-ups: testutil skip message still says
+localhost; gofmt step ignores gofmt's own exit status (vet catches parse errors).
 Why: today `command -v staticcheck && staticcheck ./... || echo …` succeeds even when staticcheck
 reports problems, and `golangci-lint … || true` hides that it can't run on Go 1.26 — a lint step
 that can't fail checks nothing
