@@ -15,10 +15,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
 )
 
@@ -29,13 +31,20 @@ type Store interface {
 }
 
 // Lifecycle moves an instance on after the API has committed it. In M1 it is
-// *lifecycle.Driver, which walks a new instance to RUNNING within the request
-// (ADR-0001 Amendment 1); the M2 controller replaces it.
+// *lifecycle.Driver, which walks a new instance to RUNNING and a deleted one
+// to TERMINATED within the request (ADR-0001 Amendment 1); the M2 controller
+// replaces it.
 type Lifecycle interface {
 	// AfterCreate is called once per fresh create, with the instance's id
 	// and its resource_version at the create commit. It logs its own
 	// errors; the instance stays in its last committed state.
 	AfterCreate(ctx context.Context, id string, rv int64) (store.Instance, error)
+	// Delete moves an instance that is in state from at version expectedRV
+	// to TERMINATING and then TERMINATED (from TERMINATING: only the last
+	// step). It returns the instance as its last successful step left it
+	// (zero if none) and the error that stopped it, already logged. A
+	// non-zero instance with an error means TERMINATING was committed.
+	Delete(ctx context.Context, id string, from statemachine.State, expectedRV int64) (store.Instance, error)
 }
 
 const (
@@ -60,10 +69,18 @@ const (
 	// stuck Postgres fails the request instead of piling up goroutines.
 	requestTimeout = 10 * time.Second
 
-	// lifecycleTimeout bounds the M1 lifecycle walk after a create (two
-	// small transactions). It runs after requestTimeout's work, and the two
-	// together stay under the server's 15s WriteTimeout (cmd/apiserver).
+	// lifecycleTimeout bounds the M1 lifecycle work of one request: the
+	// walk after a create, or all delete walks of one DELETE together
+	// (small transactions each). It runs on top of requestTimeout's work,
+	// and the two together stay under the server's 15s WriteTimeout
+	// (cmd/apiserver).
 	lifecycleTimeout = 3 * time.Second
+
+	// deleteRetries is how many times a DELETE without If-Match re-reads
+	// the instance and tries again after losing a race (ErrStaleVersion),
+	// before giving up with 409 (ADR-0001 Amendment 1). So the walk is
+	// attempted at most 1 + deleteRetries times.
+	deleteRetries = 3
 )
 
 // Error codes in the {"error": {"code", "message"}} envelope.
@@ -74,6 +91,8 @@ const (
 	codeQuotaExceeded        = "quota_exceeded"
 	codeKeyReused            = "idempotency_key_reused"
 	codeNotFound             = "not_found"
+	codeStaleVersion         = "stale_resource_version"
+	codeInvalidTransition    = "invalid_transition"
 	codeInsufficientCapacity = "insufficient_capacity"
 	codeInternal             = "internal"
 )
@@ -105,6 +124,7 @@ func NewHandler(s Store, lc Lifecycle, log *slog.Logger) *Handler {
 	h := &Handler{store: s, lifecycle: lc, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/instances", h.create)
 	h.mux.HandleFunc("GET /v1/instances/{id}", h.get)
+	h.mux.HandleFunc("DELETE /v1/instances/{id}", h.delete)
 	return h
 }
 
@@ -256,6 +276,208 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeInstance(w, http.StatusOK, inst)
+}
+
+// delete asks for an instance to be stopped (ADR-0001 §API (M1),
+// Amendment 1). Order of checks: the instance must exist for this tenant
+// (404); an instance already TERMINATED or FAILED is answered 202 with its
+// current state and nothing is written; a stale If-Match is 409; otherwise
+// the lifecycle walks it to TERMINATED, releasing its GPUs and quota in the
+// last step (invariant 5).
+//
+// The response is 202 with the instance at TERMINATING and its ETag, as in
+// M2, even though a GET right after already shows TERMINATED. When the walk
+// resumes an instance a crash left in TERMINATING, that is the instance as
+// read (this request committed only TERMINATED).
+//
+// Without If-Match, losing a race (another writer moved the instance between
+// our read and the walk) re-reads and tries again from the state it now has,
+// up to deleteRetries times. If a concurrent DELETE finished the instance,
+// the answer is 202 with that state; only an instance still not terminal
+// after the last re-read is 409. With If-Match, the client asked for one
+// specific version, so losing the race is 409 at once.
+func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
+	tenant, reqErr := headerValue(r, headerTenant, maxTenantLen)
+	if reqErr != nil {
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
+		return
+	}
+	precondition, reqErr := parseIfMatch(r.Header.Get("If-Match"))
+	if reqErr != nil {
+		writeError(w, reqErr.status, reqErr.code, reqErr.message)
+		return
+	}
+	id := r.PathValue("id")
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	// The walks are detached from client cancellation, like the create walk:
+	// a client hanging up must not stop a walk between TERMINATING and the
+	// release. One budget covers every attempt of this request.
+	lcCtx, lcCancel := context.WithTimeout(context.WithoutCancel(r.Context()), lifecycleTimeout)
+	defer lcCancel()
+
+	// Ownership is checked here: Get is scoped to the tenant, the
+	// lifecycle (store.Transition) is not.
+	inst, err := h.store.Get(ctx, tenant, id)
+	for attempt := 0; ; attempt++ {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, codeNotFound, "instance "+id+" not found")
+			return
+		case err != nil:
+			h.internalError(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
+			return
+		}
+
+		if statemachine.IsTerminal(inst.State) {
+			// Already gone: DELETE is idempotent, nothing is written.
+			h.log.Info("delete of a terminal instance", "instance_id", id, "tenant", tenant,
+				"state", inst.State, "resource_version", inst.ResourceVersion, "result", "already_terminal")
+			writeInstance(w, http.StatusAccepted, inst)
+			return
+		}
+		if precondition != nil && !precondition.matches(inst.ResourceVersion) {
+			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+				"resource_version", inst.ResourceVersion, "result", codeStaleVersion)
+			writeStale(w, id)
+			return
+		}
+
+		last, walkErr := h.lifecycle.Delete(lcCtx, id, inst.State, inst.ResourceVersion)
+		switch {
+		case walkErr == nil:
+			h.log.Info("instance deleted", "instance_id", id, "tenant", tenant, "from", inst.State,
+				"state", last.State, "resource_version", last.ResourceVersion, "result", "terminated")
+			writeInstance(w, http.StatusAccepted, terminatingView(last))
+			return
+		case last.ID != "" && errors.Is(walkErr, store.ErrStaleVersion):
+			// This walk committed TERMINATING, then lost the release step:
+			// another DELETE finished the instance first. The delete was
+			// accepted, so this is never a 409; the instance as it is now
+			// decides the body (TERMINATED, normally).
+			h.log.Info("delete finished by a concurrent request", "instance_id", id, "tenant", tenant,
+				"resource_version", last.ResourceVersion, "result", "terminated_elsewhere")
+			if now, rerr := h.store.Get(ctx, tenant, id); rerr == nil && statemachine.IsTerminal(now.State) {
+				writeInstance(w, http.StatusAccepted, now)
+				return
+			}
+			// Re-read failed or not terminal yet: what we committed is true.
+			writeInstance(w, http.StatusAccepted, last)
+			return
+		case last.ID != "" || (inst.State == statemachine.Terminating && !errors.Is(walkErr, store.ErrStaleVersion)):
+			// TERMINATING is committed (by this walk, or an earlier one we
+			// were resuming) and the release step failed with a real error.
+			// The delete was accepted, so this is never a 409 or 500: the
+			// client sees TERMINATING, and in M1 another DELETE resumes the
+			// walk. The driver has logged the cause.
+			at := inst
+			if last.ID != "" {
+				at = last
+			}
+			h.log.Warn("delete accepted but the instance is stuck in TERMINATING", "instance_id", id,
+				"tenant", tenant, "resource_version", at.ResourceVersion, "result", "terminating", "err", walkErr)
+			writeInstance(w, http.StatusAccepted, at)
+			return
+		case errors.Is(walkErr, store.ErrStaleVersion):
+			// Nothing changed; someone moved the instance after we read it.
+			if precondition != nil {
+				// The client asked to delete one specific version, and the
+				// instance is no longer at it: 409 even if a concurrent
+				// DELETE has since finished it, so the client re-reads.
+				h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+					"resource_version", inst.ResourceVersion, "attempts", attempt+1, "result", codeStaleVersion)
+				writeStale(w, id)
+				return
+			}
+			// Re-read and decide again from the state it has now: it may
+			// have moved on (create walk), be TERMINATING (resume) or be
+			// terminal (another DELETE won; the loop answers 202).
+			inst, err = h.store.Get(ctx, tenant, id)
+			if attempt < deleteRetries || err != nil || statemachine.IsTerminal(inst.State) {
+				if err == nil && statemachine.IsTerminal(inst.State) {
+					h.log.Info("delete finished by a concurrent request", "instance_id", id, "tenant", tenant,
+						"state", inst.State, "resource_version", inst.ResourceVersion, "attempts", attempt+1)
+				}
+				continue
+			}
+			// Out of retries and the instance is still not terminal.
+			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+				"resource_version", inst.ResourceVersion, "attempts", attempt+1, "result", codeStaleVersion)
+			writeStale(w, id)
+			return
+		case errors.Is(walkErr, store.ErrInvalidTransition):
+			// SCHEDULED, PROVISIONING and RUNNING all have an edge to
+			// TERMINATING; PENDING (v2) does not (ADR-0001 §API).
+			writeError(w, http.StatusConflict, codeInvalidTransition,
+				"instance "+id+" cannot be deleted in state "+string(inst.State))
+			return
+		case errors.Is(walkErr, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, codeNotFound, "instance "+id+" not found")
+			return
+		default:
+			h.internalError(w, "delete instance", walkErr, "tenant", tenant, "instance_id", id,
+				"state", inst.State)
+			return
+		}
+	}
+}
+
+// terminatingView is the instance as the delete's TERMINATING step left it,
+// given the instance after the walk's last step, TERMINATING → TERMINATED.
+// store.Transition bumps resource_version by exactly 1 per step, so
+// TERMINATING was the version before. The API reports TERMINATING so the
+// DELETE response is the same in M1 and M2 (ADR-0001 Amendment 1).
+func terminatingView(final store.Instance) store.Instance {
+	if final.State != statemachine.Terminated {
+		return final
+	}
+	view := final
+	view.State = statemachine.Terminating
+	view.ResourceVersion--
+	return view
+}
+
+func writeStale(w http.ResponseWriter, id string) {
+	writeError(w, http.StatusConflict, codeStaleVersion,
+		"instance "+id+" has changed; read it again and retry")
+}
+
+// ifMatch is a parsed If-Match header: the resource versions the client
+// accepts.
+type ifMatch struct {
+	versions []string // ETags, quotes included
+}
+
+func (m *ifMatch) matches(rv int64) bool {
+	return slices.Contains(m.versions, etagFor(rv))
+}
+
+// parseIfMatch parses an If-Match header into the versions it accepts. It
+// returns nil (no precondition) if the header is absent or "*" (any current
+// instance, RFC 9110 §13.1.1). Otherwise it is a comma-separated list of
+// entity tags. Each must be quoted ("3") or weak (W/"3"); anything else is
+// 400. Comparison is strong, as RFC 9110 requires for If-Match: a weak tag
+// is valid but never matches. The value is never echoed back.
+func parseIfMatch(header string) (*ifMatch, *requestError) {
+	header = strings.TrimSpace(header)
+	if header == "" || header == "*" {
+		return nil, nil
+	}
+	m := &ifMatch{}
+	for _, tag := range strings.Split(header, ",") {
+		tag = strings.TrimSpace(tag)
+		weak := strings.HasPrefix(tag, "W/")
+		opaque := strings.TrimPrefix(tag, "W/")
+		if len(opaque) < 2 || opaque[0] != '"' || opaque[len(opaque)-1] != '"' ||
+			strings.Contains(opaque[1:len(opaque)-1], `"`) {
+			return nil, invalid(`If-Match must be "*" or a list of quoted ETags such as "3"`)
+		}
+		if !weak {
+			m.versions = append(m.versions, opaque)
+		}
+	}
+	return m, nil
 }
 
 // requestError is a client error found before calling the store. message is

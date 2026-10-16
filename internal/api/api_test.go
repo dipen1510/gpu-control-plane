@@ -31,6 +31,8 @@ type fakeStore struct {
 	createResult *store.CreateResult // if set, returned instead of a fresh instance
 	getInst      store.Instance
 	getErr       error
+	getSeq       []store.Instance // if non-empty, Get returns these in order, then getInst
+	getCalls     int
 }
 
 func (f *fakeStore) Create(_ context.Context, req store.CreateRequest) (store.CreateResult, error) {
@@ -48,6 +50,12 @@ func (f *fakeStore) Create(_ context.Context, req store.CreateRequest) (store.Cr
 }
 
 func (f *fakeStore) Get(context.Context, string, string) (store.Instance, error) {
+	f.getCalls++
+	if len(f.getSeq) > 0 {
+		inst := f.getSeq[0]
+		f.getSeq = f.getSeq[1:]
+		return inst, nil
+	}
 	return f.getInst, f.getErr
 }
 
@@ -59,10 +67,45 @@ type lifecycleCall struct {
 	hasDeadline bool
 }
 
-// fakeLifecycle records AfterCreate calls and returns err.
+// deleteCall is one Delete call as the fake saw it.
+type deleteCall struct {
+	id          string
+	from        statemachine.State
+	rv          int64
+	ctxErr      error
+	hasDeadline bool
+}
+
+// deleteResult is one scripted Delete result.
+type deleteResult struct {
+	inst store.Instance
+	err  error
+}
+
+// fakeLifecycle records AfterCreate calls and returns err. Delete returns
+// deleteResults in order; once they run out it succeeds like the real
+// driver, returning the instance at TERMINATED.
 type fakeLifecycle struct {
 	calls []lifecycleCall
 	err   error
+
+	deleteCalls   []deleteCall
+	deleteResults []deleteResult
+}
+
+func (f *fakeLifecycle) Delete(ctx context.Context, id string, from statemachine.State, rv int64) (store.Instance, error) {
+	_, hasDeadline := ctx.Deadline()
+	f.deleteCalls = append(f.deleteCalls, deleteCall{id: id, from: from, rv: rv, ctxErr: ctx.Err(), hasDeadline: hasDeadline})
+	if len(f.deleteResults) > 0 {
+		r := f.deleteResults[0]
+		f.deleteResults = f.deleteResults[1:]
+		return r.inst, r.err
+	}
+	steps := int64(2)
+	if from == statemachine.Terminating {
+		steps = 1
+	}
+	return store.Instance{ID: id, State: statemachine.Terminated, ResourceVersion: rv + steps}, nil
 }
 
 func (f *fakeLifecycle) AfterCreate(ctx context.Context, id string, rv int64) (store.Instance, error) {

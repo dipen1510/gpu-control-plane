@@ -72,7 +72,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-7 | 1 | Create fails cleanly: quota 403, capacity 503 | implementer | S1-6 | Done |
 | S1-8 | 2 | Idempotent create | implementer | S1-6 | Done |
 | S1-9 | 2 | Lifecycle transitions with resource_version and release | implementer | S1-1, S1-6 | Done |
-| S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Proposed |
+| S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Done |
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Proposed |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Proposed |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
@@ -297,7 +297,14 @@ Acceptance:
 Out of scope: provisioning timeout and Pods (M2); HTTP exposure beyond DELETE (S1-10)
 
 ### S1-10 (1 pt) — DELETE ends at TERMINATED and releases capacity
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16; concurrent-delete 409 fixed before commit)
+Review: verifier stress (4800 concurrent DELETEs, 600 create-vs-delete races) found no 500s and no
+double release, but a DELETE without If-Match racing the create walk AND another DELETE could get 409
+although the instance ended TERMINATED (23–29% in that race). Fixed: re-read before giving up and return
+202 if terminal; TestDeleteConcurrentWithCreateWalk (400 DELETEs) fails 7–15% without the fix.
+Decisions: no "re-DELETE" hint in the body (keep M1/M2 contract; document + S1-13 stuck metric);
+with If-Match, losing a race stays 409. Follow-ups: If-Match reads only the first header line;
+404/409 messages echo the unvalidated path id; walk budget starts before the first Get.
 Notes from S1-14 review (must handle): Delete always tries →TERMINATING first, so resuming an
 instance left in TERMINATING needs the caller to pass the current state (e.g. Delete(ctx, id, from,
 rv)) and skip done steps; TERMINATED/FAILED → 202 without calling the driver. A step-2 error means

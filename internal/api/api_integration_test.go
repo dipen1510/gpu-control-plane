@@ -20,6 +20,7 @@ import (
 	"github.com/dipen1510/gpu-control-plane/internal/lifecycle"
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/seed"
+	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
 	"github.com/dipen1510/gpu-control-plane/internal/testutil"
 )
@@ -33,7 +34,7 @@ func newServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 }
 
 // newServerWithDriver is newServer that also returns the driver, so tests
-// can run the delete walk directly (HTTP DELETE is S1-10).
+// can run the delete walk directly, without HTTP.
 func newServerWithDriver(t *testing.T) (*httptest.Server, *pgxpool.Pool, *lifecycle.Driver) {
 	t.Helper()
 	db := testutil.NewDB(t)
@@ -580,7 +581,7 @@ func TestCreateThenGetIsRunning(t *testing.T) {
 func TestDriverOutboxOnePerStep(t *testing.T) {
 	srv, db, driver := newServerWithDriver(t)
 	created := createInstance(t, srv, "t1", "k1", `{"gpu_type":"A100","gpu_count":4}`)
-	if _, err := driver.Delete(t.Context(), created.ID, 3); err != nil {
+	if _, err := driver.Delete(t.Context(), created.ID, statemachine.Running, 3); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 

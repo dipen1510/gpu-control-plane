@@ -4,7 +4,8 @@
 // store.Transition per step:
 //
 //	AfterCreate: SCHEDULED → PROVISIONING → RUNNING
-//	Delete:      <current> → TERMINATING → TERMINATED   (GPUs and quota released)
+//	Delete:      <current> → TERMINATING → TERMINATED   (GPUs and quota released;
+//	             from TERMINATING only the last step)
 //
 // Each step is its own transaction with one outbox event and a
 // resource_version check, and uses the version returned by the previous step.
@@ -63,19 +64,33 @@ func (d *Driver) AfterCreate(ctx context.Context, id string, rv int64) (store.In
 	return d.walk(ctx, "create", id, statemachine.Scheduled, rv, createPath)
 }
 
-// Delete walks an instance that is at version expectedRV to TERMINATED,
-// through TERMINATING; the last step releases its GPUs and quota. It returns
-// the instance as its last successful step left it (zero if no step
-// succeeded) and the error that stopped the walk, if any, already logged.
-// An error on the first step means nothing changed: the caller can map
-// ErrStaleVersion and ErrInvalidTransition to a client error.
-func (d *Driver) Delete(ctx context.Context, id string, expectedRV int64) (store.Instance, error) {
-	return d.walk(ctx, "delete", id, "", expectedRV, deletePath)
+// Delete walks an instance that is in state from at version expectedRV to
+// TERMINATED, through TERMINATING; the last step releases its GPUs and
+// quota. If from is already TERMINATING (a walk that stopped after its first
+// step, e.g. a crash), it resumes with the last step only, so the instance
+// is never asked to move to TERMINATING twice.
+//
+// It returns the instance as its last successful step left it (zero if no
+// step succeeded) and the error that stopped the walk, if any, already
+// logged. A zero instance with an error means this call changed nothing: the
+// caller can map ErrStaleVersion and ErrInvalidTransition to a client error.
+// A non-zero instance with an error means TERMINATING was committed and only
+// the release step failed.
+//
+// from only picks the path; the store's resource_version check is what
+// makes it safe if from is out of date (the first step gets
+// ErrStaleVersion).
+func (d *Driver) Delete(ctx context.Context, id string, from statemachine.State, expectedRV int64) (store.Instance, error) {
+	path := deletePath
+	if from == statemachine.Terminating {
+		path = deletePath[1:]
+	}
+	return d.walk(ctx, "delete", id, from, expectedRV, path)
 }
 
 // walk applies path one step at a time, chaining resource versions. from is
-// the state the instance is known to be in at rv, or "" if the caller didn't
-// say; it is only used for logging.
+// the state the instance is known to be in at rv; it is only used for
+// logging.
 func (d *Driver) walk(ctx context.Context, op, id string, from statemachine.State, rv int64,
 	path []statemachine.State) (store.Instance, error) {
 	var last store.Instance
@@ -96,9 +111,6 @@ func (d *Driver) walk(ctx context.Context, op, id string, from statemachine.Stat
 func (d *Driver) logStop(ctx context.Context, op, id string, state statemachine.State, rv int64,
 	to statemachine.State, err error) {
 	left := string(state)
-	if left == "" {
-		left = "unchanged" // first delete step failed; the instance was not touched
-	}
 	level, msg := slog.LevelError, "lifecycle step failed; instance left in its last committed state"
 	if errors.Is(err, store.ErrStaleVersion) {
 		level, msg = slog.LevelInfo, "lifecycle step lost a race; instance left in its last committed state"

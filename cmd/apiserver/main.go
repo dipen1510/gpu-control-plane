@@ -68,8 +68,8 @@ func run(log *slog.Logger, addr string) error {
 
 	// No reserve-conflict counter until metrics land (S1-13).
 	st := store.New(pool, scheduler.New(nil))
-	// M1 only: walks each new instance to RUNNING (ADR-0001 Amendment 1);
-	// replaced by the controller in M2.
+	// M1 only: walks each new instance to RUNNING and each deleted one to
+	// TERMINATED (ADR-0001 Amendment 1); replaced by the controller in M2.
 	driver := lifecycle.New(st, log)
 	// Timeouts bound how long one connection can hold a goroutine, so a slow
 	// or idle client can neither exhaust the server nor stall shutdown:
@@ -77,8 +77,8 @@ func run(log *slog.Logger, addr string) error {
 	//   ReadTimeout 10s: headers plus the whole body (≤4 KB); a client
 	//     trickling the body (slowloris) is cut off here.
 	//   WriteTimeout 15s: longer than the handler's 10s database budget
-	//     (api.requestTimeout) plus the 3s lifecycle walk after a create
-	//     (api.lifecycleTimeout), so a slow-but-successful request still
+	//     (api.requestTimeout) plus the 3s lifecycle budget of a create or
+	//     delete (api.lifecycleTimeout), so a slow-but-successful request still
 	//     gets its response.
 	//   IdleTimeout 60s: keep-alive connections are reused for polling GETs
 	//     but not held forever.

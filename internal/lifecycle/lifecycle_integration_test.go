@@ -111,7 +111,7 @@ func TestDeleteEndsTerminatedAndReleases(t *testing.T) {
 		t.Fatalf("while RUNNING accounting = %+v, want %+v plus 4 each", held, before)
 	}
 
-	got, err := d.Delete(t.Context(), inst.ID, running.ResourceVersion)
+	got, err := d.Delete(t.Context(), inst.ID, statemachine.Running, running.ResourceVersion)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestDeleteEndsTerminatedAndReleases(t *testing.T) {
 	// Released exactly once: deleting again (current or stale version)
 	// changes nothing and writes no event.
 	for _, rv := range []int64{5, running.ResourceVersion} {
-		if _, err := d.Delete(t.Context(), inst.ID, rv); err == nil {
+		if _, err := d.Delete(t.Context(), inst.ID, statemachine.Running, rv); err == nil {
 			t.Errorf("second Delete at rv %d succeeded, want an error", rv)
 		}
 	}
@@ -166,16 +166,17 @@ func (r *raceStore) Transition(ctx context.Context, id string, to statemachine.S
 func TestDriverLosesToDelete(t *testing.T) {
 	tests := []struct {
 		name       string
-		at         int   // create-driver step the delete wins before
-		deleteAtRV int64 // version the delete sees
+		at         int                // create-driver step the delete wins before
+		deleteFrom statemachine.State // state the delete sees
+		deleteAtRV int64              // version the delete sees
 		wantEvents []string
 	}{
 		{
-			name: "before PROVISIONING", at: 1, deleteAtRV: 1,
+			name: "before PROVISIONING", at: 1, deleteFrom: statemachine.Scheduled, deleteAtRV: 1,
 			wantEvents: []string{"instance.scheduled", "instance.terminating", "instance.terminated"},
 		},
 		{
-			name: "before RUNNING", at: 2, deleteAtRV: 2,
+			name: "before RUNNING", at: 2, deleteFrom: statemachine.Provisioning, deleteAtRV: 2,
 			wantEvents: []string{"instance.scheduled", "instance.provisioning",
 				"instance.terminating", "instance.terminated"},
 		},
@@ -189,7 +190,7 @@ func TestDriverLosesToDelete(t *testing.T) {
 			deleter := New(s, discard())
 			var deleteErr error
 			rs := &raceStore{Store: s, at: tc.at, beforeCall: func(ctx context.Context) {
-				_, deleteErr = deleter.Delete(ctx, inst.ID, tc.deleteAtRV)
+				_, deleteErr = deleter.Delete(ctx, inst.ID, tc.deleteFrom, tc.deleteAtRV)
 			}}
 			_, err := New(rs, discard()).AfterCreate(t.Context(), inst.ID, inst.ResourceVersion)
 

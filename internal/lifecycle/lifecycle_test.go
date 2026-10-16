@@ -63,9 +63,27 @@ func TestDriverWalksPath(t *testing.T) {
 		{
 			name: "Delete",
 			run: func(d *Driver) (store.Instance, error) {
-				return d.Delete(context.Background(), "inst_1", 3)
+				return d.Delete(context.Background(), "inst_1", statemachine.Running, 3)
 			},
 			wantCalls: []step{{statemachine.Terminating, 3}, {statemachine.Terminated, 4}},
+			wantState: statemachine.Terminated, wantRV: 5,
+		},
+		{
+			name: "Delete from SCHEDULED",
+			run: func(d *Driver) (store.Instance, error) {
+				return d.Delete(context.Background(), "inst_1", statemachine.Scheduled, 1)
+			},
+			wantCalls: []step{{statemachine.Terminating, 1}, {statemachine.Terminated, 2}},
+			wantState: statemachine.Terminated, wantRV: 3,
+		},
+		{
+			// A walk left in TERMINATING (crash) resumes with the last step
+			// only; asking for TERMINATING again would be an illegal move.
+			name: "Delete resumes from TERMINATING",
+			run: func(d *Driver) (store.Instance, error) {
+				return d.Delete(context.Background(), "inst_1", statemachine.Terminating, 4)
+			},
+			wantCalls: []step{{statemachine.Terminated, 4}},
 			wantState: statemachine.Terminated, wantRV: 5,
 		},
 	}
@@ -120,13 +138,24 @@ func TestDriverStopsOnError(t *testing.T) {
 		},
 		{
 			name: "Delete step 1", failAt: 1, wantCalls: 1,
-			run:      func(d *Driver) (store.Instance, error) { return d.Delete(context.Background(), "inst_1", 3) },
-			wantLeft: "unchanged", wantLast: "", wantTo: statemachine.Terminating,
+			run: func(d *Driver) (store.Instance, error) {
+				return d.Delete(context.Background(), "inst_1", statemachine.Running, 3)
+			},
+			wantLeft: "RUNNING", wantLast: "", wantTo: statemachine.Terminating,
 		},
 		{
 			name: "Delete step 2", failAt: 2, wantCalls: 2,
-			run:      func(d *Driver) (store.Instance, error) { return d.Delete(context.Background(), "inst_1", 3) },
+			run: func(d *Driver) (store.Instance, error) {
+				return d.Delete(context.Background(), "inst_1", statemachine.Running, 3)
+			},
 			wantLeft: "TERMINATING", wantLast: statemachine.Terminating, wantTo: statemachine.Terminated,
+		},
+		{
+			name: "Delete resume step", failAt: 1, wantCalls: 1,
+			run: func(d *Driver) (store.Instance, error) {
+				return d.Delete(context.Background(), "inst_1", statemachine.Terminating, 4)
+			},
+			wantLeft: "TERMINATING", wantLast: "", wantTo: statemachine.Terminated,
 		},
 	}
 	errs := []struct {
