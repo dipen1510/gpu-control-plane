@@ -71,10 +71,25 @@ run:
 db-down:
 	docker rm -f $(PG_CONTAINER)
 
+# kind-up is idempotent: creates the cluster only if missing, then (re)applies
+# labels and the fake GPU capacity. The JSON-patch "add" on an existing key
+# replaces it, so re-running is a no-op. Every kubectl call pins the kind
+# context so it can never touch another cluster.
+KCTX        := kubectl --context kind-$(CLUSTER)
+GPU_PER_NODE ?= 8
+# worker:type:zone
+GPU_WORKERS := worker:H100:zone-a worker2:H100:zone-b worker3:A100:zone-a worker4:A100:zone-b
+
 kind-up:
-	kind create cluster --name $(CLUSTER) --config deploy/kind/cluster.yaml
-	kubectl label node $(CLUSTER)-worker  gpu.example.com/type=H100 --overwrite
-	kubectl label node $(CLUSTER)-worker2 gpu.example.com/type=A100 --overwrite
+	@kind get clusters 2>/dev/null | grep -qx '$(CLUSTER)' \
+		|| kind create cluster --name $(CLUSTER) --config deploy/kind/cluster.yaml --wait 120s
+	@set -e; for w in $(GPU_WORKERS); do \
+		n=$(CLUSTER)-$${w%%:*}; rest=$${w#*:}; t=$${rest%%:*}; z=$${rest#*:}; \
+		$(KCTX) label node $$n gpu.example.com/type=$$t topology.kubernetes.io/zone=$$z --overwrite; \
+		$(KCTX) patch node $$n --subresource=status --type=json \
+			-p '[{"op":"add","path":"/status/capacity/gpu.example.com~1gpu","value":"$(GPU_PER_NODE)"}]'; \
+	done
+	$(KCTX) get nodes -L gpu.example.com/type -L topology.kubernetes.io/zone
 
 kind-down:
 	kind delete cluster --name $(CLUSTER)

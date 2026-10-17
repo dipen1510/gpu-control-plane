@@ -5,7 +5,10 @@ description: Step-by-step procedure to build images and deploy gpu-control-plane
 # Deploying to kind
 
 Cluster name: `gpu-cp` (see `Makefile`). Config: `deploy/kind/cluster.yaml`.
-Two workers act as GPU nodes, labeled `gpu.example.com/type=H100|A100`.
+Four workers act as GPU nodes (`make kind-up`): `gpu-cp-worker`, `-worker2` = H100;
+`-worker3`, `-worker4` = A100; zones alternate `zone-a`/`zone-b` (`topology.kubernetes.io/zone`);
+each has extended resource `gpu.example.com/gpu: 8` patched into node status. `make kind-up` is
+idempotent (re-run to restore labels/capacity).
 
 ## 0. Preconditions
 ```sh
