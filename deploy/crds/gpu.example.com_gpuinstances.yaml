@@ -1,0 +1,133 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: gpuinstances.gpu.example.com
+spec:
+  group: gpu.example.com
+  names:
+    kind: GPUInstance
+    listKind: GPUInstanceList
+    plural: gpuinstances
+    shortNames:
+    - gpui
+    singular: gpuinstance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.state
+      name: STATE
+      type: string
+    - jsonPath: .spec.nodeName
+      name: NODE
+      type: string
+    - jsonPath: .spec.gpuCount
+      name: GPUS
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: AGE
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GPUInstance mirrors one Postgres instance row (ADR-0002 §GPUInstance
+          CRD).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              GPUInstanceSpec is copied once from the DB row when the CR is created and
+              never changes in M2a. The API server rejects any spec update.
+            properties:
+              gpuCount:
+                description: GPUCount is the number of GPUs held on NodeName.
+                format: int32
+                minimum: 1
+                type: integer
+              gpuType:
+                description: GPUType is the requested GPU model, e.g. H100.
+                minLength: 1
+                type: string
+              instanceID:
+                description: |-
+                  InstanceID is the original DB ID (e.g. "inst_ab"). Lookups use this or
+                  the instance-id label, never the object name (D37).
+                minLength: 1
+                type: string
+              nodeName:
+                description: NodeName is the node the scheduler placed the instance
+                  on.
+                minLength: 1
+                type: string
+              tenantID:
+                description: TenantID owns the instance.
+                minLength: 1
+                type: string
+            required:
+            - gpuCount
+            - gpuType
+            - instanceID
+            - nodeName
+            - tenantID
+            type: object
+            x-kubernetes-validations:
+            - message: spec is immutable
+              rule: self == oldSelf
+          status:
+            description: |-
+              GPUInstanceStatus is copied from the DB row after each committed
+              transition; on any disagreement the DB wins.
+            properties:
+              lastSyncTime:
+                description: LastSyncTime is when the status was last copied from
+                  the DB.
+                format: date-time
+                type: string
+              podName:
+                description: PodName is the Pod running the instance.
+                type: string
+              reason:
+                description: Reason explains a FAILED or TERMINATING state (e.g. boot_failed).
+                type: string
+              resourceVersion:
+                description: ResourceVersion is the DB row's resource_version (not
+                  the Kubernetes one).
+                format: int64
+                type: integer
+              state:
+                description: State is the DB state.
+                enum:
+                - PENDING
+                - SCHEDULED
+                - PROVISIONING
+                - RUNNING
+                - TERMINATING
+                - TERMINATED
+                - FAILED
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

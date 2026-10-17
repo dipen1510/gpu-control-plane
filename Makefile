@@ -133,7 +133,7 @@ db-kind-down:
 
 # --- S2-4: controller codegen and envtest ---------------------------------
 CONTROLLER_GEN ?= $(GO) run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.23.0
-SETUP_ENVTEST  ?= $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
+SETUP_ENVTEST  ?= $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
 ENVTEST_K8S_VERSION ?= 1.37.0
 ENVTEST_BIN_DIR ?= $(CURDIR)/bin/envtest
 
