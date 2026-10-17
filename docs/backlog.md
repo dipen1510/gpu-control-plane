@@ -525,7 +525,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 | S2-14 | 2 | Helm chart (apiserver + controller), `make deploy`, smoke test | deployer | S2-3, S2-12, S2-18 | Proposed |
 | S2-15 | 2 | Reconciler spec tests (envtest) from ADR-0002 | test-engineer | S2-4 | Proposed |
 | S2-16 | 2 | End-to-end lifecycle tests on kind | test-engineer | S2-14, S2-19 | Proposed |
-| S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Proposed |
+| S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Done |
 | S2-18 | 2 | NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED | implementer | S2-4, S2-17 | Proposed |
 | S2-19 | 1 | Node sync edge cases: deleted node, capacity below allocated, type change | implementer | S2-18 | Proposed |
 
@@ -773,7 +773,8 @@ Acceptance:
 Out of scope: chaos suite (M4); stopping a kind node container (M2b / M4)
 
 ### S2-17 (2 pts) — `nodes.status` replaces `schedulable`; Place only on READY
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done
+Result: verifier approved 2026-10-17 (mutation test proves the reserve guard). Note for S2-18: every node upsert must set `status` explicitly (column default is READY).
 Why: one column decides placement; a node that is not Ready must never get new GPUs (D39, invariant 1)
 Design link: ADR-0002 §Data model changes, §Node sync, M2-e; Discussion D39, D32
 Depends on: —

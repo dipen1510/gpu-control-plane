@@ -35,8 +35,8 @@ func TestNodes(t *testing.T) {
 					t.Errorf("duplicate id %q", nd.ID)
 				}
 				ids[nd.ID] = true
-				if nd.Capacity != 8 || !nd.Schedulable || nd.FailureDomain == "" {
-					t.Errorf("node %+v: want capacity 8, schedulable, failure domain set", nd)
+				if nd.Capacity != 8 || nd.Status != "READY" || nd.FailureDomain == "" {
+					t.Errorf("node %+v: want capacity 8, READY, failure domain set", nd)
 				}
 			}
 			if count["H100"] != tc.wantH100 || count["A100"] != tc.wantA100 {

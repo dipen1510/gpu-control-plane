@@ -12,18 +12,18 @@ func seeded(seed uint64) func(int) int {
 }
 
 func h100(id NodeID, free int) Node {
-	return Node{ID: id, GPUType: "H100", Capacity: 8, Allocated: 8 - free, Schedulable: true, FailureDomain: "fd-a"}
+	return Node{ID: id, GPUType: "H100", Capacity: 8, Allocated: 8 - free, Status: NodeReady, FailureDomain: "fd-a"}
 }
 
 // TestRankWorkedExample reproduces the D5 table: 10 H100 nodes, a 2-GPU
 // request. n2 fits exactly and ranks first; n5 has too few free GPUs and n7
-// is draining, so both are excluded.
+// is cordoned, so both are excluded.
 func TestRankWorkedExample(t *testing.T) {
 	nodes := []Node{
 		h100("n1", 8), h100("n2", 2), h100("n3", 5), h100("n4", 8), h100("n5", 1),
 		h100("n6", 4), h100("n7", 8), h100("n8", 6), h100("n9", 8), h100("n10", 7),
 	}
-	nodes[6].Schedulable = false // n7 draining
+	nodes[6].Status = NodeCordoned // n7 cordoned
 	req := Request{TenantID: "t1", GPUType: "H100", GPUCount: 2}
 
 	for seed := range uint64(20) {
@@ -57,10 +57,12 @@ func TestRankFilters(t *testing.T) {
 		want bool // included?
 	}{
 		{name: "fits", node: h100("n", 4), want: true},
-		{name: "wrong gpu type", node: Node{ID: "n", GPUType: "A100", Capacity: 8, Schedulable: true}, want: false},
-		{name: "not schedulable", node: Node{ID: "n", GPUType: "H100", Capacity: 8, Schedulable: false}, want: false},
+		{name: "wrong gpu type", node: Node{ID: "n", GPUType: "A100", Capacity: 8, Status: NodeReady}, want: false},
+		{name: "not ready", node: Node{ID: "n", GPUType: "H100", Capacity: 8, Status: NodeNotReady}, want: false},
+		{name: "cordoned", node: Node{ID: "n", GPUType: "H100", Capacity: 8, Status: NodeCordoned}, want: false},
+		{name: "empty status", node: Node{ID: "n", GPUType: "H100", Capacity: 8}, want: false},
 		{name: "too few free", node: h100("n", 3), want: false},
-		{name: "over-allocated snapshot", node: Node{ID: "n", GPUType: "H100", Capacity: 8, Allocated: 10, Schedulable: true}, want: false},
+		{name: "over-allocated snapshot", node: Node{ID: "n", GPUType: "H100", Capacity: 8, Allocated: 10, Status: NodeReady}, want: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -167,8 +169,8 @@ func TestRankDoesNotModifyInputAndHandlesNoCandidates(t *testing.T) {
 }
 
 func TestFragmentedGPUs(t *testing.T) {
-	draining := h100("d", 4)
-	draining.Schedulable = false
+	cordoned := h100("d", 4)
+	cordoned.Status = NodeCordoned
 	tests := []struct {
 		name  string
 		nodes []Node
@@ -179,8 +181,8 @@ func TestFragmentedGPUs(t *testing.T) {
 		{name: "full node", nodes: []Node{h100("a", 0)}, want: 0},
 		{name: "two half-free nodes: 8 free but no 8-GPU slot", nodes: []Node{h100("a", 4), h100("b", 4)}, want: 8},
 		{name: "mixed", nodes: []Node{h100("a", 8), h100("b", 3), h100("c", 1)}, want: 4},
-		{name: "draining node not counted", nodes: []Node{draining, h100("a", 2)}, want: 2},
-		{name: "16-GPU node with 12 free leaves 4 stranded", nodes: []Node{{ID: "big", GPUType: "H100", Capacity: 16, Allocated: 4, Schedulable: true}}, want: 4},
+		{name: "cordoned node not counted", nodes: []Node{cordoned, h100("a", 2)}, want: 2},
+		{name: "16-GPU node with 12 free leaves 4 stranded", nodes: []Node{{ID: "big", GPUType: "H100", Capacity: 16, Allocated: 4, Status: NodeReady}}, want: 4},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

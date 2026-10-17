@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,25 +21,25 @@ import (
 )
 
 type nodeRow struct {
-	id          NodeID
-	gpuType     string
-	capacity    int
-	allocated   int
-	schedulable bool
-	domain      string
+	id        NodeID
+	gpuType   string
+	capacity  int
+	allocated int
+	status    NodeStatus
+	domain    string
 }
 
 func h100Row(id NodeID, allocated int, domain string) nodeRow {
-	return nodeRow{id: id, gpuType: "H100", capacity: 8, allocated: allocated, schedulable: true, domain: domain}
+	return nodeRow{id: id, gpuType: "H100", capacity: 8, allocated: allocated, status: NodeReady, domain: domain}
 }
 
 func insertNodes(t *testing.T, db *pgxpool.Pool, nodes ...nodeRow) {
 	t.Helper()
 	for _, n := range nodes {
 		if _, err := db.Exec(t.Context(), `INSERT INTO nodes
-			(id, gpu_type, capacity, allocated, schedulable, failure_domain)
+			(id, gpu_type, capacity, allocated, status, failure_domain)
 			VALUES ($1, $2, $3, $4, $5, $6)`,
-			n.id, n.gpuType, n.capacity, n.allocated, n.schedulable, n.domain); err != nil {
+			n.id, n.gpuType, n.capacity, n.allocated, string(n.status), n.domain); err != nil {
 			t.Fatalf("insert node %s: %v", n.id, err)
 		}
 	}
@@ -151,8 +152,8 @@ func TestPlaceInsufficientCapacity(t *testing.T) {
 			nodes: []nodeRow{
 				h100Row("full-1", 8, "rack-0"),
 				h100Row("full-2", 7, "rack-1"), // 1 free, request needs 2
-				{id: "draining", gpuType: "H100", capacity: 8, allocated: 0, schedulable: false, domain: "rack-2"},
-				{id: "a100", gpuType: "A100", capacity: 8, allocated: 0, schedulable: true, domain: "rack-3"},
+				{id: "draining", gpuType: "H100", capacity: 8, allocated: 0, status: NodeCordoned, domain: "rack-2"},
+				{id: "a100", gpuType: "A100", capacity: 8, allocated: 0, status: NodeReady, domain: "rack-3"},
 			},
 			wantAlloc: map[NodeID]int{"full-1": 8, "full-2": 7, "draining": 0, "a100": 0},
 		},
@@ -333,9 +334,9 @@ func waitUntilBlocked(t *testing.T, db *pgxpool.Pool, pid uint32) bool {
 	return false
 }
 
-// The best node is drained (schedulable = false) after the snapshot; the
-// UPDATE's "AND schedulable" refuses it and Place falls back.
-func TestPlaceSkipsNodeDrainedAfterSnapshot(t *testing.T) {
+// The best node turns NOT_READY after the snapshot; the reserve UPDATE's
+// "status = 'READY'" refuses it and Place falls back to the next node.
+func TestPlaceRefusesNodeTurnedNotReady(t *testing.T) {
 	db := testutil.NewDB(t)
 	insertNodes(t, db, h100Row("best", 6, "rack-0"), h100Row("second", 4, "rack-1"))
 	conflicts := &atomicCounter{}
@@ -344,8 +345,8 @@ func TestPlaceSkipsNodeDrainedAfterSnapshot(t *testing.T) {
 		if len(candidates) == 0 || candidates[0] != "best" {
 			t.Errorf("snapshot ranking = %v, want best first", candidates)
 		}
-		if _, err := db.Exec(ctx, `UPDATE nodes SET schedulable = false WHERE id = 'best'`); err != nil {
-			t.Errorf("drain node: %v", err)
+		if _, err := db.Exec(ctx, `UPDATE nodes SET status = 'NOT_READY' WHERE id = 'best'`); err != nil {
+			t.Errorf("mark node NOT_READY: %v", err)
 		}
 	}
 
@@ -577,4 +578,36 @@ func placeOnce(ctx context.Context, db *pgxpool.Pool, s *Scheduler, req Request)
 		return "", err
 	}
 	return id, tx.Commit(ctx)
+}
+
+// Only READY nodes are candidates. The NOT_READY and CORDONED nodes would be
+// the best fit (fullest), so Place picks them if the status filter is missing.
+func TestPlaceSkipsNonReady(t *testing.T) {
+	db := testutil.NewDB(t)
+	notReady := h100Row("not-ready", 6, "rack-0")
+	notReady.status = NodeNotReady
+	cordoned := h100Row("cordoned", 6, "rack-1")
+	cordoned.status = NodeCordoned
+	insertNodes(t, db, notReady, cordoned, h100Row("ready", 0, "rack-2"))
+	s := New(nil)
+	s.beforeReserve = func(_ context.Context, candidates []NodeID) {
+		if !slices.Equal(candidates, []NodeID{"ready"}) {
+			t.Errorf("candidates = %v, want [ready]", candidates)
+		}
+	}
+
+	tx := begin(t, db)
+	got, err := s.Place(t.Context(), tx, h100Req(2))
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+	commit(t, tx)
+
+	if got != "ready" {
+		t.Errorf("Place = %s, want ready", got)
+	}
+	want := map[NodeID]int{"not-ready": 6, "cordoned": 6, "ready": 2}
+	if alloc := allocatedByNode(t, db); !maps.Equal(alloc, want) {
+		t.Errorf("allocated = %v, want %v", alloc, want)
+	}
 }

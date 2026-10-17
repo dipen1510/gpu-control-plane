@@ -4,7 +4,7 @@
 // inventory writer in M2.
 //
 // Column ownership (Discussion D15): the seed writes only the inventory
-// columns gpu_type, capacity, schedulable, failure_domain and last_seen. It
+// columns gpu_type, capacity, status, failure_domain and last_seen. It
 // never writes allocated, which belongs to placement and release; rewriting
 // it here could erase a reservation made since the seed last ran and allow
 // over-allocation (invariant 1).
@@ -40,7 +40,7 @@ type Node struct {
 	ID            string
 	GPUType       string
 	Capacity      int
-	Schedulable   bool
+	Status        string // nodes.status; always READY for seeded nodes
 	FailureDomain string
 }
 
@@ -65,7 +65,7 @@ func Nodes(n int) ([]Node, error) {
 			ID:            fmt.Sprintf("node-%04d", i),
 			GPUType:       gpuType,
 			Capacity:      GPUsPerNode,
-			Schedulable:   true,
+			Status:        "READY",
 			FailureDomain: fmt.Sprintf("rack-%d", ((i-1)/2)%Racks),
 		})
 	}
@@ -81,14 +81,16 @@ type Execer interface {
 // The DO UPDATE SET list names only seed-owned columns; allocated must never
 // appear in it (D15). A new row gets allocated's column default of 0.
 const upsertSQL = `
-INSERT INTO nodes (id, gpu_type, capacity, schedulable, failure_domain, last_seen)
-SELECT id, gpu_type, capacity, schedulable, failure_domain, now()
-FROM unnest($1::text[], $2::text[], $3::integer[], $4::boolean[], $5::text[])
-    AS n(id, gpu_type, capacity, schedulable, failure_domain)
+INSERT INTO nodes (id, gpu_type, capacity, status, failure_domain, last_seen)
+SELECT id, gpu_type, capacity, status, failure_domain, now()
+FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[], $5::text[])
+    AS n(id, gpu_type, capacity, status, failure_domain)
 ON CONFLICT (id) DO UPDATE SET
     gpu_type       = EXCLUDED.gpu_type,
     capacity       = EXCLUDED.capacity,
-    schedulable    = EXCLUDED.schedulable,
+    status_changed_at = CASE WHEN nodes.status = EXCLUDED.status
+                             THEN nodes.status_changed_at ELSE now() END,
+    status         = EXCLUDED.status,
     failure_domain = EXCLUDED.failure_domain,
     last_seen      = EXCLUDED.last_seen`
 
@@ -98,13 +100,13 @@ func Upsert(ctx context.Context, db Execer, nodes []Node) error {
 	ids := make([]string, len(nodes))
 	types := make([]string, len(nodes))
 	caps := make([]int32, len(nodes))
-	sched := make([]bool, len(nodes))
+	statuses := make([]string, len(nodes))
 	domains := make([]string, len(nodes))
 	for i, n := range nodes {
-		ids[i], types[i], caps[i], sched[i], domains[i] =
-			n.ID, n.GPUType, int32(n.Capacity), n.Schedulable, n.FailureDomain
+		ids[i], types[i], caps[i], statuses[i], domains[i] =
+			n.ID, n.GPUType, int32(n.Capacity), n.Status, n.FailureDomain
 	}
-	if _, err := db.Exec(ctx, upsertSQL, ids, types, caps, sched, domains); err != nil {
+	if _, err := db.Exec(ctx, upsertSQL, ids, types, caps, statuses, domains); err != nil {
 		return fmt.Errorf("upsert %d nodes: %w", len(nodes), err)
 	}
 	return nil

@@ -78,10 +78,10 @@ WITH tenant_domains AS (
     FROM instances i JOIN nodes m ON m.id = i.node_id
     WHERE i.tenant_id = $3 AND i.state = ANY($4::text[])
 )
-SELECT n.id, n.gpu_type, n.capacity, n.allocated, n.schedulable, n.failure_domain,
+SELECT n.id, n.gpu_type, n.capacity, n.allocated, n.status, n.failure_domain,
        n.failure_domain IN (SELECT failure_domain FROM tenant_domains)
 FROM nodes n
-WHERE n.gpu_type = $1 AND n.schedulable AND n.allocated + $2 <= n.capacity`
+WHERE n.gpu_type = $1 AND n.status = 'READY' AND n.allocated + $2 <= n.capacity`
 
 // reserveSQL is the reservation and the guard for invariant 1. Under READ
 // COMMITTED, if another transaction holds the row, Postgres waits for it to
@@ -94,7 +94,7 @@ WHERE n.gpu_type = $1 AND n.schedulable AND n.allocated + $2 <= n.capacity`
 // rolls back to it on 0 rows, which releases locks taken since the savepoint.
 const reserveSQL = `
 UPDATE nodes SET allocated = allocated + $2
-WHERE id = $1 AND schedulable AND allocated + $2 <= capacity`
+WHERE id = $1 AND status = 'READY' AND allocated + $2 <= capacity`
 
 // Place reserves req.GPUCount GPUs of req.GPUType on one node inside tx and
 // returns that node. The caller commits or rolls back tx; a rollback undoes
@@ -102,7 +102,7 @@ WHERE id = $1 AND schedulable AND allocated + $2 <= capacity`
 //
 // It reads a lock-free snapshot, ranks the candidates, then tries a
 // conditional UPDATE on each, best first, each in its own savepoint. A
-// candidate that filled up or was drained since the snapshot updates 0 rows;
+// candidate that filled up or stopped being READY since the snapshot updates 0 rows;
 // Place rolls back to the savepoint, which drops any row lock the UPDATE
 // waited for, and moves on to the next one. So when Place returns, tx holds a
 // lock on the reserved node only, never on a losing candidate; holding
@@ -149,7 +149,7 @@ func (s *Scheduler) Place(ctx context.Context, tx pgx.Tx, req Request) (NodeID, 
 
 // reserve tries to reserve n GPUs on node id. It reports false, and leaves
 // tx holding no lock on the node, if the node no longer has room or is no
-// longer schedulable. On error tx is unusable and the caller must roll it
+// longer READY. On error tx is unusable and the caller must roll it
 // back, which releases everything.
 func reserve(ctx context.Context, tx pgx.Tx, id NodeID, n int) (bool, error) {
 	sp, err := tx.Begin(ctx) // SAVEPOINT
@@ -188,7 +188,7 @@ func snapshot(ctx context.Context, tx pgx.Tx, req Request) ([]Node, map[string]b
 	for rows.Next() {
 		var n Node
 		var tenantHere bool
-		if err := rows.Scan(&n.ID, &n.GPUType, &n.Capacity, &n.Allocated, &n.Schedulable,
+		if err := rows.Scan(&n.ID, &n.GPUType, &n.Capacity, &n.Allocated, &n.Status,
 			&n.FailureDomain, &tenantHere); err != nil {
 			return nil, nil, fmt.Errorf("scan node snapshot: %w", err)
 		}

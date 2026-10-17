@@ -302,3 +302,86 @@ func TestConcurrentMigrateAppliesOnce(t *testing.T) {
 		t.Fatalf("%d versions recorded, want %d", len(got), len(migs))
 	}
 }
+
+func TestSchemaRejectsUnknownNodeStatus(t *testing.T) {
+	db := testutil.NewDB(t)
+	insertNode(t, db, "n1", 8)
+
+	for _, s := range []string{"READY", "NOT_READY", "PROBATION", "CORDONED", "QUARANTINED"} {
+		if _, err := db.Exec(t.Context(), `UPDATE nodes SET status = $1 WHERE id = 'n1'`, s); err != nil {
+			t.Fatalf("status %s: %v", s, err)
+		}
+	}
+	_, err := db.Exec(t.Context(), `UPDATE nodes SET status = 'DRAINING' WHERE id = 'n1'`)
+	requirePgError(t, err, sqlstateCheckViolation, "nodes_status_valid")
+}
+
+// TestNodesStatusBackfill applies the migrations before 0006 in a scratch
+// schema, inserts nodes with the old boolean true and false, then applies 0006 and
+// checks the backfill (true → READY, false → CORDONED) and the dropped column.
+func TestNodesStatusBackfill(t *testing.T) {
+	db := testutil.NewDB(t)
+	ctx := t.Context()
+	migs, err := migrate.Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // scratch schema is never committed
+
+	if _, err := tx.Exec(ctx, `CREATE SCHEMA backfill; SET LOCAL search_path = backfill`); err != nil {
+		t.Fatal(err)
+	}
+	run := func(m migrate.Migration) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, m.SQL); err != nil {
+			t.Fatalf("apply %d_%s: %v", m.Version, m.Name, err)
+		}
+	}
+	var statusMig *migrate.Migration
+	for i := range migs {
+		if migs[i].Name == "nodes_status" {
+			statusMig = &migs[i]
+			break
+		}
+		run(migs[i])
+	}
+	if statusMig == nil {
+		t.Fatal("nodes_status migration not found")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO nodes (id, gpu_type, capacity, schedulable)
+		VALUES ('on', 'H100', 8, true), ('off', 'H100', 8, false)`); err != nil {
+		t.Fatal(err)
+	}
+	run(*statusMig)
+
+	got := map[string]string{}
+	rows, err := tx.Query(ctx, `SELECT id, status FROM nodes`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id, s string
+		if err := rows.Scan(&id, &s); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = s
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got["on"] != "READY" || got["off"] != "CORDONED" {
+		t.Fatalf("backfill = %v, want on=READY off=CORDONED", got)
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'backfill' AND table_name = 'nodes' AND column_name = 'schedulable'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("old boolean column still exists after the migration")
+	}
+}

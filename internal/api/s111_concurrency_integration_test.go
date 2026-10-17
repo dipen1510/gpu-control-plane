@@ -454,11 +454,11 @@ func TestConcurrentCreateDeleteChurn(t *testing.T) {
 
 // s111FillNode creates the given GPU counts on one node through the API
 // (so every allocated GPU belongs to a real instance and invariant 7 holds),
-// by making that node the only schedulable one for the duration. Each
+// by making that node the only READY one for the duration. Each
 // create uses a fresh tenant so quota never interferes.
 func s111FillNode(t *testing.T, ctx context.Context, env *s111Env, node string, counts []int) {
 	t.Helper()
-	if _, err := env.db.Exec(ctx, `UPDATE nodes SET schedulable = (id = $1)`, node); err != nil {
+	if _, err := env.db.Exec(ctx, `UPDATE nodes SET status = CASE WHEN id = $1 THEN 'READY' ELSE 'CORDONED' END`, node); err != nil {
 		t.Fatalf("isolate %s: %v", node, err)
 	}
 	for i, n := range counts {
@@ -471,8 +471,8 @@ func s111FillNode(t *testing.T, ctx context.Context, env *s111Env, node string, 
 			t.Fatalf("fill %s with %d GPUs: %+v, %v", node, n, r, err)
 		}
 	}
-	if _, err := env.db.Exec(ctx, `UPDATE nodes SET schedulable = true`); err != nil {
-		t.Fatalf("restore schedulable: %v", err)
+	if _, err := env.db.Exec(ctx, `UPDATE nodes SET status = 'READY'`); err != nil {
+		t.Fatalf("restore READY: %v", err)
 	}
 }
 

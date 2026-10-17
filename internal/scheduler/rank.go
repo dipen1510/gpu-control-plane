@@ -27,6 +27,20 @@ const WholeNodeGPUs = 8
 // NodeID identifies a node (the `nodes.id` column).
 type NodeID string
 
+// NodeStatus is the `nodes.status` column (Discussion D32, D39). Only READY
+// nodes get new GPUs.
+type NodeStatus string
+
+// The five node statuses allowed by the nodes_status_valid CHECK. M2a writes
+// READY, NOT_READY and CORDONED; PROBATION and QUARANTINED are for M2b.
+const (
+	NodeReady       NodeStatus = "READY"
+	NodeNotReady    NodeStatus = "NOT_READY"
+	NodeProbation   NodeStatus = "PROBATION"
+	NodeCordoned    NodeStatus = "CORDONED"
+	NodeQuarantined NodeStatus = "QUARANTINED"
+)
+
 // Node is one row of the scheduling snapshot. It mirrors the `nodes` table
 // (ADR-0001) plus an optional health signal.
 type Node struct {
@@ -34,7 +48,7 @@ type Node struct {
 	GPUType       string
 	Capacity      int
 	Allocated     int
-	Schedulable   bool // false when cordoned, draining or missing heartbeats
+	Status        NodeStatus // only NodeReady takes new placements
 	FailureDomain string
 
 	// RecentFailures is a simple health signal: lower is healthier. The M1
@@ -74,8 +88,9 @@ type Scorer func(n Node, req Request) int
 // MatchesGPUType drops nodes with a different GPU type than requested.
 func MatchesGPUType(n Node, req Request) bool { return n.GPUType == req.GPUType }
 
-// IsSchedulable drops cordoned, draining or unhealthy nodes.
-func IsSchedulable(n Node, _ Request) bool { return n.Schedulable }
+// IsReady drops every node whose status is not READY (not ready, cordoned,
+// on probation or quarantined).
+func IsReady(n Node, _ Request) bool { return n.Status == NodeReady }
 
 // HasRoom drops nodes with fewer free GPUs than requested.
 func HasRoom(n Node, req Request) bool { return n.Free() >= req.GPUCount }
@@ -100,7 +115,7 @@ func SpreadTenant(n Node, req Request) int {
 
 // DefaultFilters are the D5 filters.
 func DefaultFilters() []Filter {
-	return []Filter{MatchesGPUType, IsSchedulable, HasRoom}
+	return []Filter{MatchesGPUType, IsReady, HasRoom}
 }
 
 // DefaultScorers are the D5 score and tie-breaks, in priority order.
@@ -182,13 +197,13 @@ func (r *Ranker) passes(n Node, req Request) bool {
 
 // FragmentedGPUs returns the free GPUs that cannot serve an 8-GPU request
 // (D7). Two nodes with 4 free GPUs each have 8 free in total but cannot run
-// one 8-GPU instance, so all 8 count as fragmented. Only schedulable nodes
-// count: free GPUs on a draining node are not usable capacity at all. It is
+// one 8-GPU instance, so all 8 count as fragmented. Only READY nodes
+// count: free GPUs on a node that is not READY are not usable capacity at all. It is
 // the input for the fragmentation metric.
 func FragmentedGPUs(nodes []Node) int {
 	total := 0
 	for _, n := range nodes {
-		if !n.Schedulable {
+		if n.Status != NodeReady {
 			continue
 		}
 		total += n.Free() % WholeNodeGPUs

@@ -40,7 +40,7 @@ var (
 		"GPUs per GPU type across all nodes: kind=capacity (installed) or kind=allocated (reserved by instances).",
 		[]string{"gpu_type", "kind"}, nil)
 	fragmentedDesc = prometheus.NewDesc("gpucp_scheduler_fragmented_gpus",
-		"Free GPUs on schedulable nodes that cannot serve an 8-GPU request (free % 8), per GPU type (Discussion D7).",
+		"Free GPUs on READY nodes that cannot serve an 8-GPU request (free % 8), per GPU type (Discussion D7).",
 		[]string{"gpu_type"}, nil)
 	driftDesc = prometheus.NewDesc("gpucp_store_allocation_drift_nodes",
 		"Nodes whose allocated differs from the sum of gpu_count of the capacity-holding instances on them (invariant 7). Should be 0; reported, never repaired.",
@@ -120,7 +120,7 @@ func (c *DBCollector) fail(ch chan<- prometheus.Metric, err error, descs ...*pro
 // gpu_count of the instances holding capacity on it ($1 = holding states).
 // One row per node; fine for an M1-sized fleet.
 const nodesSQL = `
-SELECT n.id, n.gpu_type, n.capacity, n.allocated, n.schedulable,
+SELECT n.id, n.gpu_type, n.capacity, n.allocated, n.status,
        n.allocated <> COALESCE(h.held, 0) AS drifted
 FROM nodes n
 LEFT JOIN (
@@ -180,7 +180,7 @@ func (c *DBCollector) readNodes(ctx context.Context) ([]scheduler.Node, int, err
 	for rows.Next() {
 		var n scheduler.Node
 		var drifted bool
-		if err := rows.Scan(&n.ID, &n.GPUType, &n.Capacity, &n.Allocated, &n.Schedulable, &drifted); err != nil {
+		if err := rows.Scan(&n.ID, &n.GPUType, &n.Capacity, &n.Allocated, &n.Status, &drifted); err != nil {
 			return nil, 0, fmt.Errorf("scan node: %w", err)
 		}
 		nodes = append(nodes, n)

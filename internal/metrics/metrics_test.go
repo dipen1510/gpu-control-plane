@@ -16,12 +16,12 @@ func TestFragmentedGPUsPerType(t *testing.T) {
 	nodes := []scheduler.Node{
 		// H100: 4 free (fragmented), 8 free (a whole node: not fragmented),
 		// 3 free on a cordoned node (not usable, not counted).
-		{ID: "h1", GPUType: "H100", Capacity: 8, Allocated: 4, Schedulable: true},
-		{ID: "h2", GPUType: "H100", Capacity: 8, Allocated: 0, Schedulable: true},
-		{ID: "h3", GPUType: "H100", Capacity: 8, Allocated: 5, Schedulable: false},
+		{ID: "h1", GPUType: "H100", Capacity: 8, Allocated: 4, Status: scheduler.NodeReady},
+		{ID: "h2", GPUType: "H100", Capacity: 8, Allocated: 0, Status: scheduler.NodeReady},
+		{ID: "h3", GPUType: "H100", Capacity: 8, Allocated: 5, Status: scheduler.NodeCordoned},
 		// A100: 2 free and 6 free: 8 free in total, all fragmented.
-		{ID: "a1", GPUType: "A100", Capacity: 8, Allocated: 6, Schedulable: true},
-		{ID: "a2", GPUType: "A100", Capacity: 8, Allocated: 2, Schedulable: true},
+		{ID: "a1", GPUType: "A100", Capacity: 8, Allocated: 6, Status: scheduler.NodeReady},
+		{ID: "a2", GPUType: "A100", Capacity: 8, Allocated: 2, Status: scheduler.NodeReady},
 	}
 	got := summarize(nodes)
 	want := map[string]typeSummary{

@@ -16,7 +16,7 @@ type row struct {
 	GPUType       string
 	Capacity      int
 	Allocated     int
-	Schedulable   bool
+	Status        string
 	FailureDomain string
 	LastSeen      time.Time
 }
@@ -24,7 +24,7 @@ type row struct {
 func readNodes(t *testing.T, db *pgxpool.Pool) map[string]row {
 	t.Helper()
 	rows, err := db.Query(t.Context(),
-		`SELECT id, gpu_type, capacity, allocated, schedulable, failure_domain, last_seen FROM nodes`)
+		`SELECT id, gpu_type, capacity, allocated, status, failure_domain, last_seen FROM nodes`)
 	if err != nil {
 		t.Fatalf("query nodes: %v", err)
 	}
@@ -33,7 +33,7 @@ func readNodes(t *testing.T, db *pgxpool.Pool) map[string]row {
 	for rows.Next() {
 		var id string
 		var r row
-		if err := rows.Scan(&id, &r.GPUType, &r.Capacity, &r.Allocated, &r.Schedulable,
+		if err := rows.Scan(&id, &r.GPUType, &r.Capacity, &r.Allocated, &r.Status,
 			&r.FailureDomain, &r.LastSeen); err != nil {
 			t.Fatalf("scan node: %v", err)
 		}
@@ -72,7 +72,7 @@ func TestSeedNodesIsIdempotent(t *testing.T) {
 			t.Errorf("node %s missing", w.ID)
 			continue
 		}
-		if r.GPUType != w.GPUType || r.Capacity != w.Capacity || r.Schedulable != w.Schedulable ||
+		if r.GPUType != w.GPUType || r.Capacity != w.Capacity || r.Status != w.Status ||
 			r.FailureDomain != w.FailureDomain || r.Allocated != 0 {
 			t.Errorf("node %s = %+v, want %+v with allocated 0", w.ID, r, w)
 		}
