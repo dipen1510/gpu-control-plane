@@ -72,6 +72,13 @@ const (
 	// 30s would make the client wait for nothing.
 	retryAfterConflictSeconds = "1"
 
+	// retryAfterUnavailableSeconds is the Retry-After on 503 unavailable
+	// (the database could not be reached). A restart or failover of Postgres
+	// takes seconds, not milliseconds: 1s would have every client hammer a
+	// database that is coming back, and capacity's 30s would keep them away
+	// long after it is up. /readyz already steers the load balancer away.
+	retryAfterUnavailableSeconds = "5"
+
 	// requestTimeout bounds the database work of one request, so a slow or
 	// stuck Postgres fails the request instead of piling up goroutines.
 	requestTimeout = 10 * time.Second
@@ -102,6 +109,7 @@ const (
 	codeInvalidTransition    = "invalid_transition"
 	codeInsufficientCapacity = "insufficient_capacity"
 	codeConflictRetry        = "conflict_retry"
+	codeUnavailable          = "unavailable"
 	codeInternal             = "internal"
 )
 
@@ -246,6 +254,11 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		h.conflictRetry(w, "create instance", err, "tenant", tenant,
 			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
 		return
+	case store.IsUnavailable(err):
+		h.metrics.CreateResult(metrics.CreateError)
+		h.unavailable(w, "create instance", err, "tenant", tenant,
+			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
+		return
 	case err != nil:
 		h.metrics.CreateResult(metrics.CreateError)
 		h.internalError(w, "create instance", err, "tenant", tenant,
@@ -363,6 +376,9 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		case store.IsDeadlock(err):
 			h.conflictRetry(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
 			return
+		case store.IsUnavailable(err):
+			h.unavailable(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
+			return
 		case err != nil:
 			h.internalError(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
 			return
@@ -458,6 +474,13 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 			// Nothing was committed (last is zero and the instance was not
 			// already TERMINATING), so a retry starts cleanly.
 			h.conflictRetry(w, "delete instance", walkErr, "tenant", tenant, "instance_id", id,
+				"node_id", inst.NodeID, "state", inst.State)
+			return
+		case store.IsUnavailable(walkErr):
+			// Usually nothing was committed. If only the COMMIT reply of
+			// RUNNING→TERMINATING was lost, TERMINATING may be stored; a retried
+			// DELETE then resumes the walk, so retrying is still safe.
+			h.unavailable(w, "delete instance", walkErr, "tenant", tenant, "instance_id", id,
 				"node_id", inst.NodeID, "state", inst.State)
 			return
 		default:
@@ -674,6 +697,20 @@ func (h *Handler) conflictRetry(w http.ResponseWriter, op string, err error, att
 	w.Header().Set("Retry-After", retryAfterConflictSeconds)
 	writeError(w, http.StatusServiceUnavailable, codeConflictRetry,
 		"the request conflicted with another one and was rolled back; retry")
+}
+
+// unavailable answers a request that failed because Postgres could not be
+// reached (store.IsUnavailable) with 503 unavailable and a Retry-After
+// (ADR-0001 §Failure modes: "Postgres down or slow → 503 with no partial
+// state"). It is not a 500: the request was fine and retrying it, with the
+// same Idempotency-Key for a create, is safe. It is logged at Error because
+// the API cannot do its job; the error, which names hosts and users, is
+// never sent to the client.
+func (h *Handler) unavailable(w http.ResponseWriter, op string, err error, attrs ...any) {
+	h.log.Error(op+" failed: database unreachable; answered 503", append(attrs, "err", err)...)
+	w.Header().Set("Retry-After", retryAfterUnavailableSeconds)
+	writeError(w, http.StatusServiceUnavailable, codeUnavailable,
+		"the service is temporarily unavailable; retry")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -177,7 +177,7 @@ func reserve(ctx context.Context, tx pgx.Tx, id NodeID, n int) (bool, error) {
 // snapshot returns the candidate nodes for req and the failure domains where
 // req's tenant has instances that hold capacity.
 func snapshot(ctx context.Context, tx pgx.Tx, req Request) ([]Node, map[string]bool, error) {
-	rows, err := tx.Query(ctx, snapshotSQL, req.GPUType, req.GPUCount, req.TenantID, holdingStates())
+	rows, err := tx.Query(ctx, snapshotSQL, req.GPUType, req.GPUCount, req.TenantID, statemachine.HoldingStates())
 	if err != nil {
 		return nil, nil, fmt.Errorf("read node snapshot: %w", err)
 	}
@@ -201,21 +201,4 @@ func snapshot(ctx context.Context, tx pgx.Tx, req Request) ([]Node, map[string]b
 		return nil, nil, fmt.Errorf("read node snapshot: %w", err)
 	}
 	return nodes, domains, nil
-}
-
-// holdingStates lists the states for which statemachine.HoldsCapacity is
-// true, so the SQL filter and the state machine cannot disagree.
-func holdingStates() []string {
-	all := []statemachine.State{
-		statemachine.Pending, statemachine.Scheduled, statemachine.Provisioning,
-		statemachine.Running, statemachine.Terminating, statemachine.Terminated,
-		statemachine.Failed,
-	}
-	var out []string
-	for _, st := range all {
-		if statemachine.HoldsCapacity(st) {
-			out = append(out, string(st))
-		}
-	}
-	return out
 }

@@ -170,7 +170,7 @@ func summarize(nodes []scheduler.Node) map[string]typeSummary {
 // readNodes returns every node and the number of nodes whose allocated
 // differs from what their instances hold.
 func (c *DBCollector) readNodes(ctx context.Context) ([]scheduler.Node, int, error) {
-	rows, err := c.db.Query(ctx, nodesSQL, holdingStates())
+	rows, err := c.db.Query(ctx, nodesSQL, statemachine.HoldingStates())
 	if err != nil {
 		return nil, 0, fmt.Errorf("read nodes: %w", err)
 	}
@@ -192,21 +192,4 @@ func (c *DBCollector) readNodes(ctx context.Context) ([]scheduler.Node, int, err
 		return nil, 0, fmt.Errorf("read nodes: %w", err)
 	}
 	return nodes, drift, nil
-}
-
-// holdingStates lists the states for which statemachine.HoldsCapacity is
-// true, so the drift query and the state machine cannot disagree.
-func holdingStates() []string {
-	all := []statemachine.State{
-		statemachine.Pending, statemachine.Scheduled, statemachine.Provisioning,
-		statemachine.Running, statemachine.Terminating, statemachine.Terminated,
-		statemachine.Failed,
-	}
-	var out []string
-	for _, s := range all {
-		if statemachine.HoldsCapacity(s) {
-			out = append(out, string(s))
-		}
-	}
-	return out
 }

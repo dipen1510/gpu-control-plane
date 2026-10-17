@@ -2,6 +2,7 @@ package statemachine
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -127,6 +128,35 @@ func TestHoldsCapacity(t *testing.T) {
 				t.Errorf("HoldsCapacity(%s) = %v, want %v", s, got, want[s])
 			}
 		})
+	}
+}
+
+// TestHoldingStates: the exported list that SQL filters on (placement's
+// snapshot, the drift gauge) is exactly the states that hold capacity, in
+// lifecycle order. It is compared with a list written out here and with
+// HoldsCapacity over every state, so a state added to the package but
+// missing from the list (or the reverse) fails.
+func TestHoldingStates(t *testing.T) {
+	want := []State{Scheduled, Provisioning, Running, Terminating}
+	got := HoldingStates()
+	if !slices.Equal(got, want) {
+		t.Fatalf("HoldingStates() = %v, want %v", got, want)
+	}
+	for _, s := range allStates {
+		if HoldsCapacity(s) != slices.Contains(got, s) {
+			t.Errorf("%s: HoldsCapacity = %v, but in HoldingStates = %v", s, HoldsCapacity(s), slices.Contains(got, s))
+		}
+	}
+	// Every state with outgoing edges is known to the list builder.
+	for from := range transitions {
+		if !slices.Contains(states, from) {
+			t.Errorf("state %s is in the transition table but not in states", from)
+		}
+	}
+	// Callers may keep or modify the result; that must not leak.
+	got[0] = Failed
+	if again := HoldingStates(); !slices.Equal(again, want) {
+		t.Errorf("modifying a returned list changed the next result: %v", again)
 	}
 }
 

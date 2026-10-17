@@ -77,15 +77,35 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Done |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Done |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Done |
-| S1-16 | 2 | M1 cleanup: review follow-ups | implementer | S1-13 | Proposed |
+| S1-16 | 2 | M1 cleanup: review follow-ups | implementer | S1-13 | Done |
+| S1-17 | 1 | DB-down 503 everywhere + holding-states behavior tests | implementer | S1-16 | Proposed |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
 the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
 
+### S1-17 (1 pt) — DB-down 503 everywhere + holding-states behavior tests
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: S1-16 review — GET still answers 500 when the DB is down; a black-holed DB times out at 10s as a
+500 (no connect timeout); and a wrong holding-states list in scheduler or metrics would pass all tests
+Depends on: S1-16
+Acceptance:
+  - GET /v1/instances/{id} with the DB unreachable → 503 unavailable, Retry-After: 5 (test)
+  - pgxpool connect timeout set (≈2–3s) so a black-holed DB yields 503 well before the 10s request
+    deadline (test with an unroutable/black-holed address or a fake dialer)
+  - integration test: a TERMINATING instance still counts for tenant failure-domain spread in Place,
+    and still counts as held so `gpucp_store_allocation_drift_nodes` stays 0 (fails if TERMINATING is
+    dropped from either list)
+  - ADR-0001 §Failure modes row "Postgres down or slow" matches the behavior
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: new endpoints
+
 ### S1-16 (2 pts) — M1 cleanup: review follow-ups
-Owner: implementer (docs part: architect)        Reviewer: verifier        Status: Proposed
+Owner: implementer (docs part: architect)        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-17)
+Result: DB unreachable → 503 unavailable, Retry-After: 5 (type/SQLSTATE detection, no string matching);
+statemachine.HoldingStates() is the single list; tests pin lost-CAS-not-counted, deadlock-after-
+TERMINATING → 202 and refuse-to-release; ADR-0001 Amendment 3. Implemented across a session restart.
 Why: close the gaps reviews found in M1 so M2 starts from a clean base; two of them are behaviors no test guards
 Depends on: S1-13
 Acceptance:

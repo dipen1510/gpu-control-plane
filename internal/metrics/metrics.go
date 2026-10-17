@@ -41,7 +41,8 @@ const (
 	// deadlock (SQLSTATE 40P01), answered 503. It should stay at 0: a
 	// non-zero value means some code path broke the lock order.
 	CreateConflictRetry = "conflict_retry"
-	// CreateError is any other failure, answered 500.
+	// CreateError is any other failure: answered 500, or 503 unavailable
+	// when the database could not be reached.
 	CreateError = "error"
 )
 

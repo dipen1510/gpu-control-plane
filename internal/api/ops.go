@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dipen1510/gpu-control-plane/internal/metrics"
@@ -129,6 +131,10 @@ func (s *statusRecorder) code() int {
 // promLogger adapts slog to promhttp's error logger.
 type promLogger struct{ log *slog.Logger }
 
+// Println logs v formatted as fmt.Println would (operands separated by
+// spaces), without the newline. promhttp passes a message and an error
+// value; logged as-is, a JSON handler would render the error as {} and the
+// cause would be lost.
 func (p promLogger) Println(v ...any) {
-	p.log.Warn("metrics: scrape error", "detail", v)
+	p.log.Warn("metrics: scrape error", "detail", strings.TrimSuffix(fmt.Sprintln(v...), "\n"))
 }

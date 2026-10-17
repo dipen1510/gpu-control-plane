@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -374,4 +375,49 @@ func deleteRequest(ctx context.Context, headers map[string]string) *http.Request
 		req.Header.Set(k, v)
 	}
 	return req
+}
+
+// failingCollector reports one metric that fails to collect, as DBCollector
+// does when the database is down.
+type failingCollector struct{ desc *prometheus.Desc }
+
+func (c failingCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+func (c failingCollector) Collect(ch chan<- prometheus.Metric) {
+	ch <- prometheus.NewInvalidMetric(c.desc, errors.New("injected: database unreachable"))
+}
+
+// TestPromLoggerLogsReadableError: a scrape error reaches the log as text
+// that names the cause, not as {} (S1-13 review: slog's JSON handler renders
+// an error inside a []any as an empty object).
+func TestPromLoggerLogsReadableError(t *testing.T) {
+	t.Run("scrape with a failing collector", func(t *testing.T) {
+		var logs bytes.Buffer
+		m := metrics.New()
+		m.Registry().MustRegister(failingCollector{desc: prometheus.NewDesc("gpucp_test_failing", "test", nil, nil)})
+		h := NewHandler(&fakeStore{}, &fakeLifecycle{}, slog.New(slog.NewJSONHandler(&logs, nil)), WithMetrics(m))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /metrics = %d, want 200 (ContinueOnError)", rec.Code)
+		}
+		var entry struct {
+			Msg    string `json:"msg"`
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+			t.Fatalf("log %q is not one JSON entry with a string detail: %v", logs.String(), err)
+		}
+		if entry.Msg != "metrics: scrape error" ||
+			!strings.HasPrefix(entry.Detail, "error gathering metrics: ") ||
+			!strings.Contains(entry.Detail, "injected: database unreachable") {
+			t.Errorf("log entry = %+v, want the scrape error with its cause as text", entry)
+		}
+	})
+	t.Run("operands formatted like Println", func(t *testing.T) {
+		var logs bytes.Buffer
+		promLogger{log: slog.New(slog.NewJSONHandler(&logs, nil))}.Println("error gathering metrics:", errors.New("boom"), 3)
+		if want := `"detail":"error gathering metrics: boom 3"`; !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %s, want it to contain %s", logs.String(), want)
+		}
+	})
 }

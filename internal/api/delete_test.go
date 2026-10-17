@@ -427,3 +427,41 @@ func TestDeleteErrorMapping(t *testing.T) {
 		})
 	}
 }
+
+// TestDeleteDeadlockAfterTerminatingIs202: a deadlock (40P01) in the release
+// step, after TERMINATING was committed, is still an accepted delete: 202 at
+// TERMINATING, not 503 conflict_retry. Telling the client to retry would be
+// wrong: the instance already changed, and the walk can be resumed by another
+// DELETE. Only a deadlock before anything committed is 503 (TestDeadlockMapsTo503).
+func TestDeleteDeadlockAfterTerminatingIs202(t *testing.T) {
+	terminating4 := instanceAt(statemachine.Terminating, 4)
+	tests := []struct {
+		name   string
+		read   store.Instance
+		result deleteResult
+	}{
+		// This walk committed TERMINATING, then the release deadlocked.
+		{name: "release step of this walk", read: instanceAt(statemachine.Running, 3),
+			result: deleteResult{inst: terminating4, err: deadlockErr()}},
+		// Resuming an instance an earlier request left in TERMINATING.
+		{name: "resuming TERMINATING", read: terminating4,
+			result: deleteResult{err: deadlockErr()}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{getInst: tc.read}
+			lc := &fakeLifecycle{deleteResults: []deleteResult{tc.result}}
+			rec, logs := serveDeleteLogged(context.Background(), fs, lc, nil)
+			assertAccepted(t, rec, statemachine.Terminating, 4)
+			if rec.Header().Get("Retry-After") != "" {
+				t.Errorf("Retry-After = %q on a 202", rec.Header().Get("Retry-After"))
+			}
+			if len(lc.deleteCalls) != 1 {
+				t.Errorf("Delete called %d times, want 1 (no new walk)", len(lc.deleteCalls))
+			}
+			if !strings.Contains(logs.String(), "stuck in TERMINATING") {
+				t.Errorf("want the stuck-TERMINATING warning in the log:\n%s", logs.String())
+			}
+		})
+	}
+}

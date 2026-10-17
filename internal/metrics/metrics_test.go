@@ -38,17 +38,6 @@ func TestFragmentedGPUsPerType(t *testing.T) {
 	}
 }
 
-// TestHoldingStates: the drift query counts exactly the states that hold
-// capacity. If a state is added to statemachine, this list must be updated
-// with it, or drift would be misreported.
-func TestHoldingStates(t *testing.T) {
-	got := holdingStates()
-	want := []string{"SCHEDULED", "PROVISIONING", "RUNNING", "TERMINATING"}
-	if !slices.Equal(got, want) {
-		t.Errorf("holdingStates() = %v, want %v", got, want)
-	}
-}
-
 func TestSummarizeEmpty(t *testing.T) {
 	if got := summarize(nil); len(got) != 0 {
 		t.Errorf("summarize(nil) = %v, want empty", got)

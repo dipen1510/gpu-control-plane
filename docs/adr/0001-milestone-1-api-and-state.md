@@ -105,9 +105,9 @@ Errors use one envelope: `{"error": {"code": "...", "message": "..."}}`.
 
 | Request | Success | Errors |
 |---|---|---|
-| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}` (state at commit), `ETag`; in M1 a `GET` right after shows RUNNING (Amendment 1) | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` · also `413` / `408` / header limits (see Amendment 2) |
+| `POST /v1/instances` + `Idempotency-Key`, body `{gpu_type, gpu_count}` | `202` `{id, state: SCHEDULED, node_id, gpu_type, gpu_count, resource_version}` (state at commit), `ETag`; in M1 a `GET` right after shows RUNNING (Amendment 1) | `400 invalid_request` · `403 quota_exceeded` · `409 idempotency_key_reused` · `503 insufficient_capacity` + `Retry-After: 30` · also `413` / `408` / header limits (see Amendment 2) · `503 conflict_retry` on deadlock, `503` when the DB is unreachable (see Amendment 3) |
 | `GET /v1/instances/{id}`, optional `If-None-Match` | `200` instance, `ETag: "<rv>"`; `304` if rv unchanged | `400` (no tenant) · `404 not_found` (also for another tenant's instance — don't leak existence) |
-| `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING; the instance ends TERMINATED with GPUs and quota released (Amendment 1) | `404` · `409 stale_resource_version` · `409 invalid_transition` |
+| `DELETE /v1/instances/{id}`, optional `If-Match` | `202` with state TERMINATING; the instance ends TERMINATED with GPUs and quota released (Amendment 1) | `404` · `409 stale_resource_version` · `409 invalid_transition` · `503` on deadlock or DB unreachable before TERMINATING commits (see Amendment 3) |
 
 A replayed create returns `202` with the original instance id, its *current*
 state, and `Idempotent-Replayed: true`. DELETE is idempotent: on an instance
@@ -152,7 +152,8 @@ Lock order everywhere: `idempotency_keys → tenant_quota → nodes → instance
 → outbox`. A transaction holds at most one node lock (losing candidates are
 not locked). *(Superseded: that is only true because each reserve attempt
 runs in a savepoint; see Amendment 2.)* Postgres deadlock detection plus a
-40P01 → 503 mapping is only the backstop.
+40P01 → 503 mapping is only the backstop (code and Retry-After: see
+Amendment 3).
 
 ### Lifecycle transitions (store.Transition)
 
@@ -250,12 +251,15 @@ against `DATABASE_URL`); `make test` stays dependency-free.
 | Crash mid-transaction (process, network, DB restart) | Partial reservation? | Not possible: the transaction rolls back as a whole. Client sees an error or timeout and retries with the same key |
 | Commit succeeded but response lost | Client thinks it failed | Retry with the same key returns the same instance |
 | Stale `resource_version` (DELETE `If-Match`, or `Transition`) | Would overwrite a newer state | 0 rows → 409 / `ErrStaleVersion`; caller re-reads |
-| Postgres down or slow | Requests fail | 503 with no partial state; per-request statement timeout via ctx; `/readyz` fails so the load balancer stops routing |
-| Two transactions lock rows in opposite order | Deadlock | Fixed lock order prevents it; Postgres detection aborts one as backstop. Lost-race locks count too: savepoints in Place (Amendment 2) |
+| Postgres down or slow | Requests fail | 503 with no partial state; per-request statement timeout via ctx; `/readyz` fails so the load balancer stops routing (see Amendment 3) |
+| Two transactions lock rows in opposite order | Deadlock | Fixed lock order prevents it; Postgres detection aborts one as backstop. Lost-race locks count too: savepoints in Place (Amendment 2). Answered `503 conflict_retry` (see Amendment 3) |
 | Concurrent identical transitions (retries, N controller replicas) | Double release; `used` below 0 | Lock counters, then compare-and-set; only the winner decrements. Losers get `ErrStaleVersion` (Amendment 2) |
 | Accounting drift from a bug | `allocated` ≠ real usage | Drift gauge alerts (D15: alert, never silently fix) |
 
 ## Observability
+
+*(The list below is the original plan; what shipped, with extra create
+results and a stuck-TERMINATING gauge, is in Amendment 3.)*
 
 Metrics (`gpucp_<subsystem>_<name>_<unit>`), all on `/metrics`:
 - `gpucp_api_requests_total{route,code}`, `gpucp_api_request_duration_seconds{route}`
@@ -270,11 +274,11 @@ Metrics (`gpucp_<subsystem>_<name>_<unit>`), all on `/metrics`:
 
 Logs: `log/slog` JSON with `instance_id`, `tenant`, `node_id`, `state`,
 `resource_version`, `result`. Health: `/healthz` (process up), `/readyz`
-(DB reachable). Traces wait for M4.
+(DB reachable; see Amendment 3). Traces wait for M4.
 
 ## Stories
 
-S1-1 to S1-14 in `docs/backlog.md` (Milestone 1; S1-14 from Amendment 1). Test-engineer stories
+S1-1 to S1-16 in `docs/backlog.md` (Milestone 1; S1-14 from Amendment 1, S1-16 from Amendment 3). Test-engineer stories
 S1-11 and S1-12 are written from this ADR in parallel with the implementer.
 
 ## Resolved questions (tech lead, 2026-10-16)
@@ -465,3 +469,99 @@ by `event_id`.
 **Proposal (tech lead to decide):** promote 6 and 7 into the invariant list
 in `CLAUDE.md`, so the verifier checks them on every story. This ADR does
 not edit `CLAUDE.md`.
+
+## Amendment 3 (2026-10-17): observability and error mapping (S1-13, S1-16)
+
+S1-13 shipped a few things this ADR did not say, and its review found two
+error cases that disagreed with §Failure modes. This records what the code
+does (`internal/api`, `internal/metrics`). Story: S1-16.
+
+### 1. Deadlock (SQLSTATE 40P01) → `503 conflict_retry` + `Retry-After: 1`
+
+Postgres breaks a deadlock by aborting one of the two transactions. That
+transaction rolled back as a whole (for a create, its idempotency key too),
+so retrying with the same key is safe. `store.IsDeadlock` detects it anywhere
+in the error chain; the API answers:
+
+| Case | Response |
+|---|---|
+| Create aborted by 40P01 | `503 conflict_retry`, `Retry-After: 1` |
+| DELETE: read or walk aborted by 40P01 *before* TERMINATING committed | `503 conflict_retry`, `Retry-After: 1` |
+| DELETE: TERMINATING committed, release step aborted by 40P01 (or any other real error) | `202` with state TERMINATING. The delete was accepted; another DELETE resumes the walk (Amendment 1) |
+
+- **Why 1s, not 30s like capacity:** a deadlock is a clash between two
+  specific transactions, and one is already gone; an immediate retry almost
+  always succeeds. 30s is for "wait until GPUs free up", which is not the
+  problem here.
+- **Why a separate code:** `insufficient_capacity` tells a client "the fleet
+  is full". Reusing it would make dashboards and clients misread a lock bug
+  as a capacity shortage.
+- **Logged at Error:** with the fixed lock order a deadlock should never
+  happen, so each one is a bug to investigate. The SQL error is logged, never
+  returned.
+- **Order matters in DELETE:** the "TERMINATING already committed → 202"
+  branches are checked before the deadlock case, so an accepted delete is
+  never reported as failed.
+
+### 2. Database unreachable → 503
+
+Create and DELETE with Postgres unreachable (connection refused, pool closed)
+answer **503 unavailable with `Retry-After: 5` (Postgres restarts take seconds: 1s would hammer it, 30s would keep clients away too long)** instead of `500 internal`, as §Failure modes
+already promised. Nothing was written, so a retry is safe. DELETE follows the
+same rule as above: once TERMINATING has committed it is 202, not 503.
+
+### 3. `/healthz` vs `/readyz`
+
+| Endpoint | Checks | Fails when | Used by |
+|---|---|---|---|
+| `/healthz` | nothing beyond "process serves HTTP" | process hung or dead | liveness: restart the process |
+| `/readyz` | DB ping, 1s timeout | DB unreachable or slow, or no check configured → `503 not_ready` | readiness: stop routing traffic here |
+
+`/healthz` deliberately ignores Postgres: if a database outage failed
+liveness, every replica would be restarted, which cannot fix the database
+and adds a restart storm on top. Neither endpoint (nor `/metrics`) is counted
+in `gpucp_api_requests_total`.
+
+### 4. Metrics actually shipped
+
+All on a **private registry** (not Prometheus' global one, so each test reads
+exact values), plus the standard Go and process collectors.
+
+Event metrics (incremented by code):
+- `gpucp_api_requests_total{route,code}`, `gpucp_api_request_duration_seconds{route}`.
+  `route` is the mux pattern (e.g. `GET /v1/instances/{id}`), never the raw
+  path; requests that match no pattern (404/405) get `route="unmatched"`, so
+  random paths cannot create unbounded series.
+- `gpucp_create_results_total{result}`: the original five (`scheduled`,
+  `replayed`, `quota_exceeded`, `insufficient_capacity`, `key_reused`) plus
+  `invalid` (any 4xx before the store), `conflict_retry` (40P01; should stay
+  0) and `error` (500, and 503 `unavailable` when the DB is unreachable). Every create lands in exactly one bucket; all series
+  start at 0.
+- `gpucp_scheduler_reserve_conflicts_total`, `gpucp_scheduler_place_duration_seconds`.
+- `gpucp_instance_transitions_total{from,to}`: counted only after the
+  transition commits; a lost CAS adds 0 (pinned by an S1-16 test).
+
+Database gauges, computed **at scrape time** by read-only queries with a 2s
+timeout. If the DB is down they are left out of that scrape (and logged);
+the event metrics are still served:
+- `gpucp_nodes_gpus{gpu_type,kind=capacity|allocated}`.
+- `gpucp_scheduler_fragmented_gpus{gpu_type}`: sum of `free mod 8` over
+  *schedulable* nodes of that type, i.e. free GPUs that cannot serve an
+  8-GPU request (D7). Per type, because free H100s and A100s never combine.
+- `gpucp_store_allocation_drift_nodes`: nodes where invariant 7 fails.
+  Reported, never fixed (D15): "fixing" it would hide the bug that caused it.
+- `gpucp_outbox_unpublished_rows`.
+- **New:** `gpucp_store_stuck_terminating_instances`: instances in
+  TERMINATING for more than 1 minute. In M1 a delete finishes within its
+  request (at most 3s), so these were left by a crash or a failed release
+  step and still hold GPUs and quota until someone DELETEs again. This is
+  the signal S1-10 chose instead of a "re-DELETE" hint in the response.
+  **Revisit in M2:** real shutdown delays in the Pod will make 1 minute
+  wrong.
+
+### 5. Known gap: `/metrics` on the API port
+
+`/metrics` is served on the API port with no in-flight limit. Each scrape
+runs the DB queries above, so a burst of scrapes competes with API traffic
+for pool connections. Acceptable for M1 (one Prometheus, local fleet).
+**Revisit in M2:** separate port and/or `promhttp` `MaxRequestsInFlight`.

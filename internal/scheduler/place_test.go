@@ -1,22 +1,6 @@
 package scheduler
 
-import (
-	"slices"
-	"testing"
-
-	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
-)
-
-func TestHoldingStatesMatchStateMachine(t *testing.T) {
-	got := holdingStates()
-	want := []string{
-		string(statemachine.Scheduled), string(statemachine.Provisioning),
-		string(statemachine.Running), string(statemachine.Terminating),
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("holdingStates() = %v, want %v", got, want)
-	}
-}
+import "testing"
 
 // Production must use the global, concurrency-safe rand (S1-4 review).
 func TestNewUsesGlobalRand(t *testing.T) {

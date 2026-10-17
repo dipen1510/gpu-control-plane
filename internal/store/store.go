@@ -13,10 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
@@ -52,6 +55,52 @@ const sqlstateDeadlock = "40P01"
 func IsDeadlock(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDeadlock
+}
+
+// IsUnavailable reports whether err (anywhere in its chain) means Postgres
+// could not be reached or the connection to it was lost, as opposed to
+// Postgres answering with an error about the request. It recognizes, by type
+// and SQLSTATE, never by message text:
+//
+//   - *pgconn.ConnectError: opening a connection failed (refused, DNS,
+//     TLS, authentication timeout, connect deadline)
+//   - puddle.ErrClosedPool: the pool was closed (shutdown)
+//   - a net.Error other than the request's own context deadline: the
+//     socket failed mid-request
+//   - SQLSTATE class 08 (connection exception) and 57P01–57P03 (server
+//     shutting down, crashed, or not yet accepting connections)
+//
+// A context deadline or cancellation on its own is not "unavailable": it
+// says this request ran out of time, not that the database is down.
+//
+// Every request a caller maps this to is safe to retry (ADR-0001 §Failure
+// modes): a create is protected by its Idempotency-Key, a DELETE is
+// idempotent, and a transaction that lost its connection was either rolled
+// back or, if COMMIT's reply was lost, committed in full.
+func IsUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) || errors.Is(err, puddle.ErrClosedPool) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"),
+			pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03":
+			return true
+		default:
+			return false
+		}
+	}
+	// context.DeadlineExceeded satisfies net.Error, so rule it out first.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // EventInstanceScheduled is the outbox event type written by Create.

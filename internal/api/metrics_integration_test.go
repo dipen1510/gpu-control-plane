@@ -111,4 +111,16 @@ func TestMetricsCreateResultsIntegration(t *testing.T) {
 		!strings.Contains(string(b), `gpucp_create_results_total{result="scheduled"} 3`) {
 		t.Errorf("GET /metrics with the pool closed = %d, want 200 with the API metrics", resp.StatusCode)
 	}
+	// Create and DELETE with the database gone: 503 unavailable, not 500
+	// (ADR-0001 §Failure modes).
+	if resp, b := do(t, http.MethodPost, srv.URL+"/v1/instances",
+		map[string]string{headerTenant: "t1", headerIdempotencyKey: "k-down"}, `{"gpu_type":"A100","gpu_count":1}`); resp.StatusCode != http.StatusServiceUnavailable ||
+		!strings.Contains(string(b), `"code":"`+codeUnavailable+`"`) || resp.Header.Get("Retry-After") != retryAfterUnavailableSeconds {
+		t.Errorf("POST with the pool closed = %d %s (Retry-After %q), want 503 %s", resp.StatusCode, b, resp.Header.Get("Retry-After"), codeUnavailable)
+	}
+	if resp, b := do(t, http.MethodDelete, srv.URL+"/v1/instances/"+a100.ID,
+		map[string]string{headerTenant: "t1"}, ""); resp.StatusCode != http.StatusServiceUnavailable ||
+		!strings.Contains(string(b), `"code":"`+codeUnavailable+`"`) {
+		t.Errorf("DELETE with the pool closed = %d %s, want 503 %s", resp.StatusCode, b, codeUnavailable)
+	}
 }

@@ -58,7 +58,7 @@ func baseConfig(t testing.TB) *pgx.ConnConfig {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
 		t.Skip("DATABASE_URL is not set: run `make db-up` and export " +
-			"DATABASE_URL=postgres://gpucp:gpucp@localhost:5432/gpucp?sslmode=disable")
+			"DATABASE_URL=postgres://gpucp:gpucp@127.0.0.1:5432/gpucp?sslmode=disable")
 	}
 	cfg, err := pgx.ParseConfig(url)
 	if err != nil {

@@ -89,3 +89,20 @@ func HoldsCapacity(s State) bool {
 		return false
 	}
 }
+
+// states is every state, in lifecycle order. It is never mutated.
+var states = []State{Pending, Scheduled, Provisioning, Running, Terminating, Terminated, Failed}
+
+// HoldingStates returns the states for which HoldsCapacity is true, in
+// lifecycle order. SQL that counts held GPUs (placement's snapshot, the
+// allocation drift gauge) filters on this list, so the queries and the state
+// machine cannot disagree. Each call returns a new slice the caller may keep.
+func HoldingStates() []State {
+	var out []State
+	for _, s := range states {
+		if HoldsCapacity(s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
