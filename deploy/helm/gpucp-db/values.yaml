@@ -1,0 +1,22 @@
+# Dev-only defaults for the local kind cluster. Never reuse these credentials
+# outside kind: they are checked in on purpose so `make db-kind-up` needs no setup.
+
+postgres:
+  image: postgres:16
+  database: gpucp
+  user: gpucp
+  password: gpucp-dev-only   # stored in a Secret, read via secretKeyRef
+  storage: 1Gi               # kind's default "standard" StorageClass (local-path)
+  storageClassName: ""       # empty = cluster default
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}
+
+migrate:
+  enabled: true
+  # Built by `make image CMD=migrate` and loaded by `make kind-load-migrate`.
+  image: gpucp-migrate
+  tag: dev
+  pullPolicy: IfNotPresent   # image comes from `kind load`, never a registry
+  backoffLimit: 4
+  activeDeadlineSeconds: 300

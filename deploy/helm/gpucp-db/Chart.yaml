@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gpucp-db
+description: Dev-only Postgres 16 for gpu-control-plane in kind, plus the migrate Job (S2-3, D26).
+type: application
+version: 0.1.0
+appVersion: "16"

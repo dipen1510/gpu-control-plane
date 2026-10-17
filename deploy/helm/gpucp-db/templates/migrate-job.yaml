@@ -1,0 +1,57 @@
+{{- if .Values.migrate.enabled }}
+{{- $m := .Values.migrate -}}
+# Helm post-install/post-upgrade hook: runs on every `helm upgrade --install`,
+# after the release resources exist. With `--wait`, Helm waits for Postgres to
+# be Ready first, then waits for this Job to Complete (or fails the release).
+# cmd/migrate is idempotent, so re-running it is a no-op (D26).
+# before-hook-creation: the previous Job is deleted only when a new one starts,
+# so the Completed Job stays visible for `kubectl get jobs`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app.kubernetes.io/name: migrate
+    {{- include "gpucp-db.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ $m.backoffLimit }}
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # The migrate image is distroless (no shell), so wait for Postgres here
+        # rather than burning Job retries on "connection refused".
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432; do echo waiting for postgres; sleep 2; done"]
+          securityContext:
+            runAsUser: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: migrate
+          image: "{{ $m.image }}:{{ $m.tag }}"
+          imagePullPolicy: {{ $m.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpucp-db.secretName" . }}
+                  key: DATABASE_URL
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+{{- end }}

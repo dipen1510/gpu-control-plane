@@ -104,3 +104,55 @@ TAG ?= dev
 image:
 	@test -n "$(CMD)" || { echo "usage: make image CMD=<apiserver|controller|migrate>" >&2; exit 1; }
 	docker build --build-arg CMD=$(CMD) -t gpucp-$(CMD):$(TAG) .
+
+# Postgres 16 + migrate Job in kind (S2-3, D26). Dev-only credentials live in
+# the chart's Secret. Builds and loads the migrate image, then installs the
+# chart; `--wait` blocks until Postgres is Ready and the migrate hook Job has
+# Completed. Re-running is safe: migrations are idempotent.
+NS        ?= gpucp
+HELM      := helm --kube-context kind-$(CLUSTER)
+.PHONY: db-kind-up db-kind-psql db-kind-down
+db-kind-up:
+	$(MAKE) image CMD=migrate TAG=$(TAG)
+	kind load docker-image gpucp-migrate:$(TAG) --name $(CLUSTER)
+	$(HELM) upgrade --install gpucp-db deploy/helm/gpucp-db \
+		--namespace $(NS) --create-namespace \
+		--set migrate.tag=$(TAG) --wait --timeout 10m
+	$(KCTX) -n $(NS) get pods,jobs,pvc
+
+# Open psql inside the Postgres Pod, e.g. `make db-kind-psql SQL='\dt'`.
+SQL ?= \dt
+db-kind-psql:
+	$(KCTX) -n $(NS) exec statefulset/postgres -- \
+		sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c "$$1"' _ '$(SQL)'
+
+# Uninstall the release and delete its PVC (all in-cluster DB data).
+db-kind-down:
+	-$(HELM) uninstall gpucp-db --namespace $(NS) --wait
+	$(KCTX) -n $(NS) delete pvc -l app.kubernetes.io/name=postgres --ignore-not-found
+
+# --- S2-4: controller codegen and envtest ---------------------------------
+CONTROLLER_GEN ?= $(GO) run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.23.0
+SETUP_ENVTEST  ?= $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
+ENVTEST_K8S_VERSION ?= 1.37.0
+ENVTEST_BIN_DIR ?= $(CURDIR)/bin/envtest
+
+.PHONY: generate manifests envtest test-envtest
+
+# Regenerate DeepCopy methods for api/v1alpha1.
+generate:
+	$(CONTROLLER_GEN) object paths=./api/...
+
+# Regenerate the GPUInstance CRD (deploy/crds) and controller ClusterRole (deploy/rbac).
+manifests:
+	$(CONTROLLER_GEN) crd rbac:roleName=gpucp-controller paths=./api/... paths=./internal/controller/... \
+		output:crd:artifacts:config=deploy/crds output:rbac:artifacts:config=deploy/rbac
+
+# Download kube-apiserver + etcd for envtest into ENVTEST_BIN_DIR.
+envtest:
+	$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(ENVTEST_BIN_DIR) -p path
+
+# Run the envtest tests (skipped by plain `make test` when KUBEBUILDER_ASSETS is unset).
+test-envtest:
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(ENVTEST_BIN_DIR) -p path)" \
+		$(GO) test -race -count=1 ./internal/controller/... ./api/...
