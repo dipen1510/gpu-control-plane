@@ -129,6 +129,9 @@ func (s *Store) Transition(ctx context.Context, id string, to statemachine.State
 	if err := tx.Commit(ctx); err != nil {
 		return Instance{}, fmt.Errorf("transition instance %s: commit: %w", id, err)
 	}
+	if s.transitions != nil {
+		s.transitions.Transitioned(from, to)
+	}
 	return next, nil
 }
 

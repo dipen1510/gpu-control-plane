@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
@@ -39,6 +40,20 @@ var (
 	ErrIdempotencyKeyReused = errors.New("idempotency key reused with a different request")
 )
 
+// sqlstateDeadlock is Postgres' deadlock_detected.
+const sqlstateDeadlock = "40P01"
+
+// IsDeadlock reports whether err (anywhere in its chain) is Postgres aborting
+// a transaction to break a deadlock (SQLSTATE 40P01). The transaction was
+// rolled back as a whole, so retrying the request is safe; with the
+// documented lock order it should never happen, so callers should log it
+// loudly (ADR-0001 §The create transaction: "40P01 → 503 is only the
+// backstop").
+func IsDeadlock(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDeadlock
+}
+
 // EventInstanceScheduled is the outbox event type written by Create.
 const EventInstanceScheduled = "instance.scheduled"
 
@@ -54,12 +69,31 @@ type Placer interface {
 	Place(ctx context.Context, tx pgx.Tx, req scheduler.Request) (scheduler.NodeID, error)
 }
 
+// TransitionObserver hears about each committed state transition. It must be
+// safe for concurrent use and must not block. *metrics.Metrics satisfies it
+// (gpucp_instance_transitions_total).
+type TransitionObserver interface {
+	Transitioned(from, to statemachine.State)
+}
+
+// Option configures a Store.
+type Option func(*Store)
+
+// WithTransitionObserver makes Transition report every transition it
+// commits, after the commit (a rolled-back attempt is never reported).
+func WithTransitionObserver(o TransitionObserver) Option {
+	return func(s *Store) { s.transitions = o }
+}
+
 // Store reads and writes instances. It holds no per-request state and is
 // safe for concurrent use; correctness across replicas comes from row locks
 // and conditional updates in Postgres, not from anything in here.
 type Store struct {
 	db     DB
 	placer Placer
+
+	// transitions, if set, is told about each committed transition.
+	transitions TransitionObserver
 
 	// afterPlace, if set, runs inside the create transaction right after
 	// Place succeeds. Tests use it to inject a failure there; production
@@ -68,8 +102,12 @@ type Store struct {
 }
 
 // New returns a Store that uses db and places instances with placer.
-func New(db DB, placer Placer) *Store {
-	return &Store{db: db, placer: placer}
+func New(db DB, placer Placer, opts ...Option) *Store {
+	s := &Store{db: db, placer: placer}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Instance is one row of the instances table.

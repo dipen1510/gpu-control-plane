@@ -75,7 +75,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-10 | 1 | DELETE ends at TERMINATED and releases capacity | implementer | S1-9, S1-14 | Done |
 | S1-11 | 2 | Concurrency test: no over-allocation, no over-quota, create/delete churn | test-engineer | S1-2 | Done |
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Done |
-| S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Proposed |
+| S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Done |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Done |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
@@ -388,7 +388,16 @@ Acceptance:
 Out of scope: HTTP-level load tests
 
 ### S1-13 (1 pt) — M1 metrics and health endpoints
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
+Result: all ADR §Observability metrics on a private registry + gpucp_store_stuck_terminating_instances
+(> 1 min); DB gauges computed at scrape time, read-only, 2s timeout; drift reported never fixed;
+route label = pattern; /healthz, /readyz (1s DB ping); SQLSTATE 40P01 → 503 conflict_retry,
+Retry-After: 1, logged at Error. Extra create results: invalid, conflict_retry, error.
+Follow-ups from review: (a) no test pins "transition counted only after commit" or "delete deadlock
+after TERMINATING committed → 202" (both survive mutation) — add tests; (b) ADR amendment for
+conflict_retry, extra results, stuck gauge; (c) promLogger logs {} for errors; (d) create with DB down
+returns 500, ADR says 503; (e) /metrics on the API port without in-flight limit (revisit in M2);
+(f) export holding-states list from statemachine (still duplicated).
 Why: we need to see contention, fragmentation and accounting drift before chaos tests in M4
 Design link: ADR-0001 §Observability
 Depends on: S1-7, S1-9

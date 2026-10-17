@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -20,6 +21,23 @@ type Counter interface {
 	Inc()
 }
 
+// Observer records a value, e.g. a duration in seconds. It must be safe for
+// concurrent use. A Prometheus histogram satisfies it.
+type Observer interface {
+	Observe(float64)
+}
+
+// Option configures a Scheduler.
+type Option func(*Scheduler)
+
+// WithPlaceDuration makes Place report how long each call took, in seconds,
+// whatever its outcome (gpucp_scheduler_place_duration_seconds). Each reserve
+// attempt costs 3 round trips (ADR-0001 Amendment 2), so this shows the price
+// of contention.
+func WithPlaceDuration(o Observer) Option {
+	return func(s *Scheduler) { s.placeDuration = o }
+}
+
 // Scheduler places instances on nodes. It holds no per-request state, so one
 // Scheduler is safe for concurrent use by many goroutines (and correctness
 // across replicas comes from the database, not from anything in here).
@@ -30,6 +48,9 @@ type Scheduler struct {
 	// refused the reservation, i.e. lost a race (gpucp_scheduler_reserve_conflicts_total).
 	reserveConflicts Counter
 
+	// placeDuration, if set, observes the duration of each Place call.
+	placeDuration Observer
+
 	// beforeReserve, if set, runs between the snapshot and the first reserve.
 	// Tests use it to change nodes behind Place's back; production leaves it nil.
 	beforeReserve func(ctx context.Context, candidates []NodeID)
@@ -39,8 +60,12 @@ type Scheduler struct {
 // uses math/rand/v2's global source, which is safe for concurrent use; a
 // seeded *rand.Rand shared across requests would be a data race.
 // reserveConflicts may be nil.
-func New(reserveConflicts Counter) *Scheduler {
-	return &Scheduler{ranker: NewRanker(nil), reserveConflicts: reserveConflicts}
+func New(reserveConflicts Counter, opts ...Option) *Scheduler {
+	s := &Scheduler{ranker: NewRanker(nil), reserveConflicts: reserveConflicts}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // snapshotSQL reads candidate nodes and, in the same statement and therefore
@@ -86,6 +111,10 @@ WHERE id = $1 AND schedulable AND allocated + $2 <= capacity`
 //
 // req.TenantFailureDomains is ignored; Place fills it from the snapshot.
 func (s *Scheduler) Place(ctx context.Context, tx pgx.Tx, req Request) (NodeID, error) {
+	if s.placeDuration != nil {
+		start := time.Now()
+		defer func() { s.placeDuration.Observe(time.Since(start).Seconds()) }()
+	}
 	if req.GPUCount < 1 {
 		// A zero or negative count would "reserve" nothing or even free GPUs.
 		return "", fmt.Errorf("place %d %s GPUs: gpu count must be at least 1", req.GPUCount, req.GPUType)

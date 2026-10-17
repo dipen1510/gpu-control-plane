@@ -97,7 +97,7 @@ func (d *Driver) walk(ctx context.Context, op, id string, from statemachine.Stat
 	for _, to := range path {
 		next, err := d.store.Transition(ctx, id, to, rv, "")
 		if err != nil {
-			d.logStop(ctx, op, id, from, rv, to, err)
+			d.logStop(ctx, op, id, last, from, rv, to, err)
 			return last, fmt.Errorf("lifecycle %s: instance %s to %s: %w", op, id, to, err)
 		}
 		last, from, rv = next, next.State, next.ResourceVersion
@@ -107,14 +107,19 @@ func (d *Driver) walk(ctx context.Context, op, id string, from statemachine.Stat
 
 // logStop records why a walk stopped and the state the instance was left
 // in. Losing a race (ErrStaleVersion) is normal, so it is logged at Info;
-// anything else at Error.
-func (d *Driver) logStop(ctx context.Context, op, id string, state statemachine.State, rv int64,
-	to statemachine.State, err error) {
+// anything else at Error. last is the instance after this walk's last
+// successful step; before the first step it is zero and tenant and node_id
+// are unknown here (the API logs them with its own record of the request).
+func (d *Driver) logStop(ctx context.Context, op, id string, last store.Instance, state statemachine.State,
+	rv int64, to statemachine.State, err error) {
 	left := string(state)
 	level, msg := slog.LevelError, "lifecycle step failed; instance left in its last committed state"
 	if errors.Is(err, store.ErrStaleVersion) {
 		level, msg = slog.LevelInfo, "lifecycle step lost a race; instance left in its last committed state"
 	}
-	d.log.Log(ctx, level, msg, "op", op, "instance_id", id, "state", left,
-		"resource_version", rv, "to", string(to), "err", err)
+	attrs := []any{"op", op, "instance_id", id, "state", left, "resource_version", rv, "to", string(to), "err", err}
+	if last.ID != "" {
+		attrs = append(attrs, "tenant", last.TenantID, "node_id", last.NodeID)
+	}
+	d.log.Log(ctx, level, msg, attrs...)
 }

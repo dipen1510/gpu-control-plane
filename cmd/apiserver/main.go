@@ -3,7 +3,8 @@
 // or SIGTERM, and drains in-flight requests before exiting.
 //
 // Configuration: DATABASE_URL (required); listen address from -addr, else
-// the ADDR environment variable, else :8080.
+// the ADDR environment variable, else :8080. Besides /v1 it serves
+// /metrics, /healthz (process up) and /readyz (database reachable).
 package main
 
 import (
@@ -22,6 +23,7 @@ import (
 
 	"github.com/dipen1510/gpu-control-plane/internal/api"
 	"github.com/dipen1510/gpu-control-plane/internal/lifecycle"
+	"github.com/dipen1510/gpu-control-plane/internal/metrics"
 	"github.com/dipen1510/gpu-control-plane/internal/migrate"
 	"github.com/dipen1510/gpu-control-plane/internal/scheduler"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
@@ -66,8 +68,12 @@ func run(log *slog.Logger, addr string) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	// No reserve-conflict counter until metrics land (S1-13).
-	st := store.New(pool, scheduler.New(nil))
+	// Metrics live on their own registry (internal/metrics). The database
+	// gauges are read at scrape time and never write (D15).
+	m := metrics.New()
+	m.Registry().MustRegister(metrics.NewDBCollector(pool, log))
+	sched := scheduler.New(m.ReserveConflicts, scheduler.WithPlaceDuration(m.PlaceDuration))
+	st := store.New(pool, sched, store.WithTransitionObserver(m))
 	// M1 only: walks each new instance to RUNNING and each deleted one to
 	// TERMINATED (ADR-0001 Amendment 1); replaced by the controller in M2.
 	driver := lifecycle.New(st, log)
@@ -87,7 +93,7 @@ func run(log *slog.Logger, addr string) error {
 	// cannot keep Shutdown waiting past its deadline.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewHandler(st, driver, log),
+		Handler:           api.NewHandler(st, driver, log, api.WithMetrics(m), api.WithReadiness(pool)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,

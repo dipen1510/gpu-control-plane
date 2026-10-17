@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dipen1510/gpu-control-plane/internal/metrics"
 	"github.com/dipen1510/gpu-control-plane/internal/statemachine"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
 )
@@ -65,6 +66,12 @@ const (
 	// (ADR-0001 resolved questions).
 	retryAfterSeconds = "30"
 
+	// retryAfterConflictSeconds is the Retry-After on 503 conflict_retry.
+	// A deadlock is between two specific transactions; Postgres has already
+	// aborted one, so an immediate retry almost always succeeds. Capacity's
+	// 30s would make the client wait for nothing.
+	retryAfterConflictSeconds = "1"
+
 	// requestTimeout bounds the database work of one request, so a slow or
 	// stuck Postgres fails the request instead of piling up goroutines.
 	requestTimeout = 10 * time.Second
@@ -94,6 +101,7 @@ const (
 	codeStaleVersion         = "stale_resource_version"
 	codeInvalidTransition    = "invalid_transition"
 	codeInsufficientCapacity = "insufficient_capacity"
+	codeConflictRetry        = "conflict_retry"
 	codeInternal             = "internal"
 )
 
@@ -116,20 +124,32 @@ type Handler struct {
 	lifecycle Lifecycle
 	log       *slog.Logger
 	mux       *http.ServeMux
+
+	metrics      *metrics.Metrics
+	serveMetrics bool   // GET /metrics is registered (WithMetrics)
+	ready        Pinger // GET /readyz pings it; nil → 503
 }
 
-// NewHandler returns the API's HTTP handler. lc is run after every fresh
-// create, before the response is written.
-func NewHandler(s Store, lc Lifecycle, log *slog.Logger) *Handler {
+// NewHandler returns the apiserver's HTTP handler: the /v1 API plus
+// GET /healthz, GET /readyz and (WithMetrics) GET /metrics. lc is run after
+// every fresh create, before the response is written.
+func NewHandler(s Store, lc Lifecycle, log *slog.Logger, opts ...Option) *Handler {
 	h := &Handler{store: s, lifecycle: lc, log: log, mux: http.NewServeMux()}
+	for _, o := range opts {
+		o(h)
+	}
+	if h.metrics == nil {
+		h.metrics = metrics.New()
+	}
 	h.mux.HandleFunc("POST /v1/instances", h.create)
 	h.mux.HandleFunc("GET /v1/instances/{id}", h.get)
 	h.mux.HandleFunc("DELETE /v1/instances/{id}", h.delete)
+	h.mux.HandleFunc(routeHealthz, h.healthz)
+	h.mux.HandleFunc(routeReadyz, h.readyz)
+	if h.serveMetrics {
+		h.mux.Handle(routeMetrics, h.metrics.Handler(promLogger{log: log}))
+	}
 	return h
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
 }
 
 // createRequest is the create body (Discussion D1).
@@ -158,11 +178,13 @@ func toResponse(inst store.Instance) instanceResponse {
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	tenant, reqErr := headerValue(r, headerTenant, maxTenantLen)
 	if reqErr != nil {
+		h.metrics.CreateResult(metrics.CreateInvalid)
 		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
 	key, reqErr := headerValue(r, headerIdempotencyKey, maxKeyLen)
 	if reqErr != nil {
+		h.metrics.CreateResult(metrics.CreateInvalid)
 		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
@@ -172,12 +194,14 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 			h.log.Info("create request rejected", "tenant", tenant, "status", reqErr.status,
 				"code", reqErr.code, "err", reqErr.cause)
 		}
+		h.metrics.CreateResult(metrics.CreateInvalid)
 		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
 	}
 
 	hash, err := requestHash(body)
 	if err != nil {
+		h.metrics.CreateResult(metrics.CreateError)
 		h.internalError(w, "create instance", err, "tenant", tenant)
 		return
 	}
@@ -194,6 +218,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		// used. Retrying the same request will not help.
 		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
 			"gpu_count", body.GPUCount, "result", codeKeyReused)
+		h.metrics.CreateResult(metrics.CreateKeyReused)
 		writeError(w, http.StatusConflict, codeKeyReused,
 			headerIdempotencyKey+" was already used with a different request body")
 		return
@@ -201,6 +226,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		// 403: retrying will not help until the tenant frees GPUs (D2).
 		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
 			"gpu_count", body.GPUCount, "result", codeQuotaExceeded)
+		h.metrics.CreateResult(metrics.CreateQuotaExceeded)
 		writeError(w, http.StatusForbidden, codeQuotaExceeded, fmt.Sprintf(
 			"%s GPU quota exceeded: %d more would go over the tenant's limit", body.GPUType, body.GPUCount))
 		return
@@ -210,11 +236,18 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		// mistaken for a quota error.
 		h.log.Info("create rejected", "tenant", tenant, "gpu_type", body.GPUType,
 			"gpu_count", body.GPUCount, "result", codeInsufficientCapacity)
+		h.metrics.CreateResult(metrics.CreateInsufficientCapacity)
 		w.Header().Set("Retry-After", retryAfterSeconds)
 		writeError(w, http.StatusServiceUnavailable, codeInsufficientCapacity, fmt.Sprintf(
 			"no node has %d free %s GPUs; retry later", body.GPUCount, body.GPUType))
 		return
+	case store.IsDeadlock(err):
+		h.metrics.CreateResult(metrics.CreateConflictRetry)
+		h.conflictRetry(w, "create instance", err, "tenant", tenant,
+			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
+		return
 	case err != nil:
+		h.metrics.CreateResult(metrics.CreateError)
 		h.internalError(w, "create instance", err, "tenant", tenant,
 			"gpu_type", body.GPUType, "gpu_count", body.GPUCount)
 		return
@@ -224,12 +257,14 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		// written (ADR-0001 §API).
 		h.log.Info("create replayed", "instance_id", res.ID, "tenant", tenant, "node_id", res.NodeID,
 			"state", res.State, "resource_version", res.ResourceVersion, "result", "replayed")
+		h.metrics.CreateResult(metrics.CreateReplayed)
 		w.Header().Set(headerReplayed, "true")
 		writeInstance(w, http.StatusAccepted, res.Instance)
 		return
 	}
 	h.log.Info("instance created", "instance_id", res.ID, "tenant", tenant, "node_id", res.NodeID,
 		"state", res.State, "resource_version", res.ResourceVersion, "result", "scheduled")
+	h.metrics.CreateResult(metrics.CreateScheduled)
 
 	// The create is committed; now walk the new instance on (M1: to
 	// RUNNING), before responding so a GET right after sees the result.
@@ -325,6 +360,9 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrNotFound):
 			writeError(w, http.StatusNotFound, codeNotFound, "instance "+id+" not found")
 			return
+		case store.IsDeadlock(err):
+			h.conflictRetry(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
+			return
 		case err != nil:
 			h.internalError(w, "delete instance: read", err, "tenant", tenant, "instance_id", id)
 			return
@@ -333,12 +371,12 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		if statemachine.IsTerminal(inst.State) {
 			// Already gone: DELETE is idempotent, nothing is written.
 			h.log.Info("delete of a terminal instance", "instance_id", id, "tenant", tenant,
-				"state", inst.State, "resource_version", inst.ResourceVersion, "result", "already_terminal")
+				"node_id", inst.NodeID, "state", inst.State, "resource_version", inst.ResourceVersion, "result", "already_terminal")
 			writeInstance(w, http.StatusAccepted, inst)
 			return
 		}
 		if precondition != nil && !precondition.matches(inst.ResourceVersion) {
-			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "node_id", inst.NodeID, "state", inst.State,
 				"resource_version", inst.ResourceVersion, "result", codeStaleVersion)
 			writeStale(w, id)
 			return
@@ -347,8 +385,8 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		last, walkErr := h.lifecycle.Delete(lcCtx, id, inst.State, inst.ResourceVersion)
 		switch {
 		case walkErr == nil:
-			h.log.Info("instance deleted", "instance_id", id, "tenant", tenant, "from", inst.State,
-				"state", last.State, "resource_version", last.ResourceVersion, "result", "terminated")
+			h.log.Info("instance deleted", "instance_id", id, "tenant", tenant, "node_id", last.NodeID,
+				"from", inst.State, "state", last.State, "resource_version", last.ResourceVersion, "result", "terminated")
 			writeInstance(w, http.StatusAccepted, terminatingView(last))
 			return
 		case last.ID != "" && errors.Is(walkErr, store.ErrStaleVersion):
@@ -357,7 +395,8 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 			// accepted, so this is never a 409; the instance as it is now
 			// decides the body (TERMINATED, normally).
 			h.log.Info("delete finished by a concurrent request", "instance_id", id, "tenant", tenant,
-				"resource_version", last.ResourceVersion, "result", "terminated_elsewhere")
+				"node_id", last.NodeID, "state", last.State, "resource_version", last.ResourceVersion,
+				"result", "terminated_elsewhere")
 			if now, rerr := h.store.Get(ctx, tenant, id); rerr == nil && statemachine.IsTerminal(now.State) {
 				writeInstance(w, http.StatusAccepted, now)
 				return
@@ -376,7 +415,7 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 				at = last
 			}
 			h.log.Warn("delete accepted but the instance is stuck in TERMINATING", "instance_id", id,
-				"tenant", tenant, "resource_version", at.ResourceVersion, "result", "terminating", "err", walkErr)
+				"tenant", tenant, "node_id", at.NodeID, "state", at.State, "resource_version", at.ResourceVersion, "result", "terminating", "err", walkErr)
 			writeInstance(w, http.StatusAccepted, at)
 			return
 		case errors.Is(walkErr, store.ErrStaleVersion):
@@ -385,7 +424,7 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 				// The client asked to delete one specific version, and the
 				// instance is no longer at it: 409 even if a concurrent
 				// DELETE has since finished it, so the client re-reads.
-				h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+				h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "node_id", inst.NodeID, "state", inst.State,
 					"resource_version", inst.ResourceVersion, "attempts", attempt+1, "result", codeStaleVersion)
 				writeStale(w, id)
 				return
@@ -397,12 +436,12 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 			if attempt < deleteRetries || err != nil || statemachine.IsTerminal(inst.State) {
 				if err == nil && statemachine.IsTerminal(inst.State) {
 					h.log.Info("delete finished by a concurrent request", "instance_id", id, "tenant", tenant,
-						"state", inst.State, "resource_version", inst.ResourceVersion, "attempts", attempt+1)
+						"node_id", inst.NodeID, "state", inst.State, "resource_version", inst.ResourceVersion, "attempts", attempt+1)
 				}
 				continue
 			}
 			// Out of retries and the instance is still not terminal.
-			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "state", inst.State,
+			h.log.Info("delete rejected", "instance_id", id, "tenant", tenant, "node_id", inst.NodeID, "state", inst.State,
 				"resource_version", inst.ResourceVersion, "attempts", attempt+1, "result", codeStaleVersion)
 			writeStale(w, id)
 			return
@@ -415,9 +454,15 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(walkErr, store.ErrNotFound):
 			writeError(w, http.StatusNotFound, codeNotFound, "instance "+id+" not found")
 			return
+		case store.IsDeadlock(walkErr):
+			// Nothing was committed (last is zero and the instance was not
+			// already TERMINATING), so a retry starts cleanly.
+			h.conflictRetry(w, "delete instance", walkErr, "tenant", tenant, "instance_id", id,
+				"node_id", inst.NodeID, "state", inst.State)
+			return
 		default:
 			h.internalError(w, "delete instance", walkErr, "tenant", tenant, "instance_id", id,
-				"state", inst.State)
+				"node_id", inst.NodeID, "state", inst.State)
 			return
 		}
 	}
@@ -614,6 +659,21 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 func (h *Handler) internalError(w http.ResponseWriter, op string, err error, attrs ...any) {
 	h.log.Error(op+" failed", append(attrs, "err", err)...)
 	writeError(w, http.StatusInternalServerError, codeInternal, "internal error")
+}
+
+// conflictRetry answers a transaction Postgres aborted to break a deadlock
+// (SQLSTATE 40P01) with 503 conflict_retry and a short Retry-After. The
+// transaction rolled back as a whole (for a create, its idempotency key too),
+// so retrying, with the same key, is safe. The code is not
+// insufficient_capacity: capacity was not the problem, and a dashboard or
+// client must be able to tell the two apart. It is logged at Error because
+// with the documented lock order a deadlock is a bug (ADR-0001 §The create
+// transaction); the error is never sent to the client.
+func (h *Handler) conflictRetry(w http.ResponseWriter, op string, err error, attrs ...any) {
+	h.log.Error(op+" aborted by a database deadlock (40P01); answered 503", append(attrs, "err", err)...)
+	w.Header().Set("Retry-After", retryAfterConflictSeconds)
+	writeError(w, http.StatusServiceUnavailable, codeConflictRetry,
+		"the request conflicted with another one and was rolled back; retry")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
