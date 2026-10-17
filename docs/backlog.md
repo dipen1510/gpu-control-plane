@@ -487,3 +487,355 @@ Acceptance:
   - `make test`, `make lint`, `make test-integration` pass
 Out of scope: crash recovery of stuck instances (M2 controller); delays, timeouts, boot
 failures (M2); HTTP DELETE wiring (S1-10)
+
+## Milestone 2 — Controller on kind (M2a / M2b / M2c)
+
+Design: `docs/adr/0002-milestone-2-controller.md` (Proposed); reasoning:
+`docs/Discussion.md` D19–D36 (accepted by the tech lead 2026-10-17).
+
+### A-5 (2 pts) — Milestone 2 ADR, discussion record and M2a stories
+Owner: architect        Reviewer: tech lead        Status: Done
+Result: Discussion D19–D39; ADR-0002 (Accepted 2026-10-17, Q4 accepted: no `source` column now) incl. "Under the hood" (controller-runtime internals,
+replaces the dropped learning story); M2 diagrams in docs/architecture.md; S2-1 … S2-19 below.
+Tech lead answers (2026-10-17): Q1 inst_x → inst-x (D37), Q3 delete terminal CRs (D38), Q2 node sync
+moved into M2a instead of a seed Job (D39 → S2-17 … S2-19)
+Acceptance:
+  - every accepted decision M2-1 … M2-16 has a D-entry with the why
+  - ADR-0002 follows the design-doc skill and has a failure modes table and invariants impact
+  - no files changed outside docs/
+Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver note): orchestrator/tech lead
+
+### M2a stories (single controller replica)
+
+| ID | Pts | Story | Owner | Depends on | Status |
+|---|---|---|---|---|---|
+| S2-1 | 1 | kind cluster: 4 fake GPU workers | deployer | — | Proposed |
+| S2-2 | 1 | Container image and `cmd/migrate` | implementer | — | Proposed |
+| S2-3 | 2 | Postgres in kind via Helm + migrate Job | deployer | S2-1, S2-2 | Proposed |
+| S2-4 | 2 | kubebuilder scaffold, GPUInstance CRD, RBAC, `cmd/controller` | implementer | — | Proposed |
+| S2-5 | 2 | DB poller + `updated_at` index | implementer | S2-4 | Proposed |
+| S2-6 | 1 | Fake GPU Pod spec builder | implementer | S2-4 | Proposed |
+| S2-7 | 2 | InstanceReconciler happy path: SCHEDULED → PROVISIONING → RUNNING | implementer | S2-5, S2-6 | Proposed |
+| S2-8 | 2 | Delete path: TERMINATING → TERMINATED with finalizer | implementer | S2-7 | Proposed |
+| S2-9 | 1 | RUNNING → FAILED edge and `pod_lost` | implementer | S2-7 | Proposed |
+| S2-10 | 2 | Boot failure and provisioning timeout | implementer | S2-8 | Proposed |
+| S2-11 | 2 | TTL: `ttl_seconds` → `expires_at` → TERMINATING | implementer | S2-8 | Proposed |
+| S2-12 | 2 | Remove the M1 driver; API DELETE stops at TERMINATING | implementer | S2-8 | Proposed |
+| S2-13 | 1 | Workqueue tuning, sizing flags and controller metrics | implementer | S2-7 | Proposed |
+| S2-14 | 2 | Helm chart (apiserver + controller), `make deploy`, smoke test | deployer | S2-3, S2-12, S2-18 | Proposed |
+| S2-15 | 2 | Reconciler spec tests (envtest) from ADR-0002 | test-engineer | S2-4 | Proposed |
+| S2-16 | 2 | End-to-end lifecycle tests on kind | test-engineer | S2-14, S2-19 | Proposed |
+| S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Proposed |
+| S2-18 | 2 | NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED | implementer | S2-4, S2-17 | Proposed |
+| S2-19 | 1 | Node sync edge cases: deleted node, capacity below allocated, type change | implementer | S2-18 | Proposed |
+
+S2-1, S2-2, S2-4 and S2-17 can start in parallel. S2-15 is written from the ADR in parallel with
+S2-7 … S2-11 and is expected to fail until they land.
+
+### S2-1 (1 pt) — kind cluster: 4 fake GPU workers
+Owner: deployer        Reviewer: verifier        Status: Proposed
+Why: the controller needs real nodes with GPU type and capacity to pin Pods on (D14)
+Design link: ADR-0002 §Context; Discussion D14, D26
+Depends on: —
+Acceptance:
+  - `deploy/kind/cluster.yaml`: 1 control-plane + 4 workers
+  - `make kind-up` labels workers `gpu.example.com/type` = H100, H100, A100, A100 and
+    `topology.kubernetes.io/zone` (failure domain), and patches node status with extended resource
+    `gpu.example.com/gpu: 8`; re-running it is a no-op
+  - `kubectl get nodes -L gpu.example.com/type` shows the 4 types; `kubectl get node <w> -o
+    jsonpath='{.status.capacity.gpu\.example\.com/gpu}'` prints 8 on each worker
+  - `make kind-down` deletes the cluster; deploy-kind skill updated (4 workers)
+Out of scope: Postgres (S2-3), node sync (M2b)
+
+### S2-2 (1 pt) — Container image and `cmd/migrate`
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: Jobs in kind need a binary that applies migrations; every component ships from one Dockerfile
+Design link: Discussion D26
+Depends on: —
+Acceptance:
+  - `cmd/migrate` applies `internal/migrate` migrations to `DATABASE_URL`, idempotent (2nd run no-op;
+    integration test `TestMigrateCommandIdempotent`)
+  - multi-stage `Dockerfile` with `--build-arg CMD=<apiserver|controller|migrate>`, distroless or
+    scratch runtime, non-root
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: Helm (S2-3); node rows (node sync, S2-18; `seed-nodes` stays local-only and its
+connect-timeout follow-up stays in M2b)
+
+### S2-3 (2 pts) — Postgres in kind via Helm + migrate Job
+Owner: deployer        Reviewer: verifier        Status: Proposed
+Why: everything in M2 runs in the cluster; migrations must run before apiserver/controller start (D26)
+Design link: Discussion D26; deploy-kind skill §2
+Depends on: S2-1, S2-2
+Acceptance:
+  - Postgres 16 in namespace `gpucp` via Helm, PVC-backed, password in a Secret, readiness probe
+  - migrate Job (Helm hook or ordered install) runs to Complete
+  - `kubectl -n gpucp exec … psql -c '\dt'` lists the 5 M1 tables and `schema_migrations` shows
+    every migration applied
+  - deleting the Postgres Pod keeps data (PVC); re-running the Job is a no-op
+Out of scope: HA Postgres, backups; node rows (filled by node sync, S2-18)
+
+### S2-4 (2 pts) — kubebuilder scaffold, GPUInstance CRD, RBAC, `cmd/controller`
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: the CR gives kubectl visibility, Pod ownership and the finalizer (D19); the Manager is the
+frame every later story plugs into
+Design link: ADR-0002 §GPUInstance CRD, §Under the hood; Discussion D19, D34
+Depends on: —
+Acceptance:
+  - `api/v1alpha1` GPUInstance types (spec/status as in ADR-0002), printer columns STATE, NODE,
+    GPUS, AGE; generated CRD under `deploy/crds/`
+  - `k8sName(id)` maps `inst_x` → `inst-x` (D37); table test incl. a DNS-1123 validity check; the
+    original ID is in label `gpu.example.com/instance-id`; nothing parses the name back
+  - RBAC markers: gpuinstances (+status, +finalizers), pods (get/list/watch/create/delete),
+    nodes (get/list/watch), leases (for M2b)
+  - `cmd/controller` starts a Manager with metrics on `:8081`, `/healthz`, `/readyz`, leader election
+    off by default (flag), a no-op InstanceReconciler registered
+  - envtest test: CRD installs; creating a GPUInstance is visible via the cache after WaitForCacheSync
+  - `make test`, `make lint` pass (envtest binaries fetched by a make target)
+Out of scope: reconcile logic (S2-7)
+
+### S2-5 (2 pts) — DB poller + `updated_at` index
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: new instances exist only in Postgres; the poller is how the controller hears about them (D20)
+Design link: ADR-0002 §Decisions M2-a, §Data model; Discussion D20
+Depends on: S2-4
+Acceptance:
+  - migration: index on `instances (updated_at)` and partial index for non-terminal rows
+  - `internal/controller/poller`: every 1s `SELECT id, now() … WHERE updated_at > $last − 5s` with
+    `$last` = previous DB `now()`; every 30s all non-terminal ids; sends ids only, into a channel
+    wired with `source.Channel`; intervals are flags
+  - integration test `TestPollerSeesChangeCommittedLate`: a row whose tx started before the previous
+    poll and committed after it is still reported (fails without the 5s overlap)
+  - integration test `TestPollerResyncListsNonTerminal`; test that the poller issues no writes
+  - poller DB errors are logged, counted, and retried next tick (no crash)
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: LISTEN/NOTIFY
+
+### S2-6 (1 pt) — Fake GPU Pod spec builder
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: boot delay, boot failure and shutdown delay live in the Pod, never in our Go code (D12, D35)
+Design link: Discussion D35, D14
+Depends on: S2-4
+Acceptance:
+  - pure `BuildPod(inst, cfg) *corev1.Pod`: name `k8sName(id)`, `spec.nodeName`, request and limit
+    `gpu.example.com/gpu: N`, labels `app=gpu-instance` + `gpu.example.com/instance-id`, ownerRef to
+    the CR, `restartPolicy: Never`
+  - init container (busybox) sleeps random `BOOT_SECONDS` in [min,max] and exits 1 with probability
+    `BOOT_FAIL_RATE`; main `sleep infinity`; `preStop` sleeps `SHUTDOWN_SECONDS`;
+    `terminationGracePeriodSeconds` > shutdown
+  - table test over the fields above; `grep -rn 'time.Sleep' internal/controller` finds nothing
+  - `make test`, `make lint` pass
+Out of scope: a custom image
+
+### S2-7 (2 pts) — InstanceReconciler happy path: SCHEDULED → PROVISIONING → RUNNING
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: the core of M2 — the controller, not the API, drives an instance to RUNNING (D21, D28)
+Design link: ADR-0002 §Reconcile, by DB state; Discussion D19, D21, D31
+Depends on: S2-5, S2-6
+Acceptance:
+  - SCHEDULED: ensure CR with finalizer, ensure Pod (`AlreadyExists` = success), then
+    `store.Transition` → PROVISIONING; PROVISIONING + Pod Ready → RUNNING; CR status patched from
+    the returned row
+  - Pod and CR informers map events to the instance-id key; poller ids feed the same queue
+  - envtest `TestReconcileHappyPath` (test sets Pod Ready, envtest has no kubelet): states and
+    outbox rows scheduled, provisioning, running in order
+  - `TestReconcileIsIdempotent`: reconciling a RUNNING instance twice makes no DB write and no
+    Kubernetes write
+  - `TestReconcileCrashAfterPodCreate`: Pod exists, DB still SCHEDULED → converges, one Pod
+  - `ErrStaleVersion` → requeue (not error log spam)
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: delete (S2-8), failures (S2-9, S2-10)
+
+### S2-8 (2 pts) — Delete path: TERMINATING → TERMINATED with finalizer
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: capacity must be released only once the Pod is really gone (invariant 5, D21)
+Design link: ADR-0002 §Reconcile, by DB state; Discussion D19, D21
+Depends on: S2-7
+Acceptance:
+  - TERMINATING: delete Pod (`NotFound` = success); when a live read confirms it is gone →
+    TERMINATED (release); then delete CR and remove finalizer
+  - `TestDeleteReleasesOnlyAfterPodGone`: while the Pod still exists, `allocated`/`used` unchanged
+  - `kubectl delete gpuinstance` (envtest delete of the CR) on a RUNNING instance → DB TERMINATING →
+    TERMINATED; finalizer removed only after the row is terminal (`TestCRDeleteHonorsFinalizer`)
+  - terminal row with a lingering CR → CR deleted (`TestTerminalRowCleansUpCR`)
+  - `make test`, `make test-integration` pass
+Out of scope: API DELETE change (S2-12)
+
+### S2-9 (1 pt) — RUNNING → FAILED edge and `pod_lost`
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: a lost RUNNING instance must not look like a user delete (D29); capacity is released (D25)
+Design link: Discussion D25, D29
+Depends on: S2-7
+Acceptance:
+  - `statemachine`: RUNNING → FAILED legal; `TestCanTransition` 49-pair table updated
+  - RUNNING with Pod missing *confirmed by live read* or Pod phase Failed → delete Pod → FAILED
+    `pod_lost`, released once
+  - `TestPodLostUsesLiveRead`: cache says missing, API says present → no transition
+  - CLAUDE.md diagram change flagged to the orchestrator (not edited here)
+Out of scope: recovery (M2c)
+
+### S2-10 (2 pts) — Boot failure and provisioning timeout
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: exercise the failure paths that D12 promised; capacity must come back
+Design link: ADR-0002 §Reconcile, by DB state; Discussion D25
+Depends on: S2-8
+Acceptance:
+  - init container terminated non-zero → delete Pod → FAILED `boot_failed`
+  - PROVISIONING longer than `--provisioning-timeout` (default 5m) measured as `db_now −
+    updated_at` → delete Pod → FAILED `provisioning_timeout`; before that, `RequeueAfter(remaining)`
+  - `TestProvisioningTimeoutUsesDBTime` (row `updated_at` set in the past; no fake controller clock)
+  - SCHEDULED with a Pod create rejected as invalid → FAILED `pod_create_failed`
+  - capacity released exactly once in each test; `make test-integration` passes
+Out of scope: retries of a failed boot
+
+### S2-11 (2 pts) — TTL: `ttl_seconds` → `expires_at` → TERMINATING
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: instances that clean themselves up; the first controller-owned → TERMINATING (D28, D30)
+Design link: Discussion D30
+Depends on: S2-8
+Acceptance:
+  - migration adds `ttl_seconds`, `expires_at`; create accepts optional `ttl_seconds` (60 … 604800,
+    else 400) and sets `expires_at = now() + ttl` in the create transaction
+  - `ttl_seconds` is part of the idempotency hash (`TestIdempotencyKeyReusedDifferentTTL` → 409)
+  - reconciler: before expiry `RequeueAfter(expires_at − db_now)`; at/after → TERMINATING
+    `ttl_expired` from SCHEDULED, PROVISIONING or RUNNING (`TestTTLExpiry` per state)
+  - GET shows `expires_at`; OpenAPI spec updated
+Out of scope: extending a TTL
+
+### S2-12 (2 pts) — Remove the M1 driver; API DELETE stops at TERMINATING
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: one owner per transition (D28); the driver was M1-only (D17, D36)
+Design link: Discussion D28, D36; ADR-0001 Amendment 1
+Depends on: S2-8
+Acceptance:
+  - `internal/lifecycle` deleted; create returns 202 SCHEDULED and a GET right after shows SCHEDULED
+  - DELETE → TERMINATING only; on TERMINATING/TERMINATED/FAILED → 202 current state, no new outbox row
+  - tests that needed later states (S1-10, S1-11 churn, S1-14) rewritten to call `store.Transition`
+    directly; churn test still proves invariants 1, 6, 7
+  - `gpucp_store_stuck_terminating_instances` threshold 5 min (ADR-0001 Amendment 3 revisit)
+  - CLAUDE.md M1-driver note change flagged to the orchestrator
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: anything in the controller
+
+### S2-13 (1 pt) — Workqueue tuning, sizing flags and controller metrics
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: bounded retries protect Postgres and the API server during outages (D34)
+Design link: ADR-0002 §Under the hood, §Observability; Discussion D34
+Depends on: S2-7
+Acceptance:
+  - rate limiter = max(per-item exponential 5ms…5min, token bucket 10 qps / burst 100);
+    `--instance-workers=8`, `--node-workers=2`, DB pool 16, kube QPS 50 / burst 100 as flags
+  - unit test: a key failing repeatedly backs off up to the cap; success calls `Forget`
+  - `/metrics` on :8081 shows `workqueue_depth`, `controller_runtime_reconcile_total` and the
+    `gpucp_controller_*` metrics in ADR-0002 §Observability (`TestControllerMetricsExposed`)
+Out of scope: priority queue
+
+### S2-14 (2 pts) — Helm chart (apiserver + controller), `make deploy`, smoke test
+Owner: deployer        Reviewer: verifier        Status: Proposed
+Why: one command builds and runs the whole M2a system in kind
+Design link: deploy-kind skill; Discussion D26
+Depends on: S2-3, S2-12
+Acceptance:
+  - `deploy/helm/gpucp`: apiserver ×3 + Service, controller ×1, ServiceAccount + RBAC from S2-4,
+    CRD, Pod env `BOOT_SECONDS`, `BOOT_FAIL_RATE` as values
+  - `make deploy` builds images tagged with the git SHA, `kind load`s them, `helm upgrade --install`
+  - smoke script: the 4 workers appear in `nodes` as READY; POST → RUNNING within 60s,
+    `kubectl get gpuinstances` shows it, DELETE → TERMINATED, Pod and CR gone; exits non-zero on
+    any failure
+Out of scope: leader election and 3 controller replicas (M2b)
+
+### S2-15 (2 pts) — Reconciler spec tests (envtest) from ADR-0002
+Owner: test-engineer        Reviewer: verifier        Status: Proposed
+Why: tests written from the spec catch the reconciler being wrong, not just different
+Design link: ADR-0002 §Reconcile, §Failure modes
+Depends on: S2-4 (fails until S2-7 … S2-11 land)
+Acceptance:
+  - table test over every DB state × Pod state (absent, pending, ready, init failed, deleting) asserting
+    the next action from ADR-0002's table
+  - restart test: new Manager over existing Pods and rows → no duplicate Pods, no wrong FAILED
+    (proves WaitForCacheSync + live read)
+  - race test: API DELETE vs controller → RUNNING on the same rv → one winner, one outbox row per state
+  - invariant 7 holds after every test (allocated = SUM of holding instances)
+Out of scope: real kubelet behavior (S2-16)
+
+### S2-16 (2 pts) — End-to-end lifecycle tests on kind
+Owner: test-engineer        Reviewer: verifier        Status: Proposed
+Why: only a real kubelet runs init containers, preStop hooks and the extended-resource check
+Design link: ADR-0002 §Failure modes
+Depends on: S2-14
+Acceptance:
+  - `make test-e2e` (build tag `e2e`): create → RUNNING; delete → TERMINATED with GPUs and quota released
+  - `BOOT_FAIL_RATE=1` → FAILED `boot_failed`, released
+  - kill the controller Pod mid-boot → instance still reaches RUNNING after restart
+  - delete a RUNNING instance's Pod by hand → FAILED `pod_lost`
+  - `kubectl cordon` a worker → its row becomes CORDONED and creates of that type avoid it;
+    `uncordon` → READY
+  - at the end `gpucp_store_allocation_drift_nodes` = 0 and no orphan Pods
+Out of scope: chaos suite (M4); stopping a kind node container (M2b / M4)
+
+### S2-17 (2 pts) — `nodes.status` replaces `schedulable`; Place only on READY
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: one column decides placement; a node that is not Ready must never get new GPUs (D39, invariant 1)
+Design link: ADR-0002 §Data model changes, §Node sync, M2-e; Discussion D39, D32
+Depends on: —
+Acceptance:
+  - migration: `status` with CHECK over the five D32 values, `status_changed_at`; backfill
+    `schedulable` true → READY, false → CORDONED; drop `schedulable`
+  - scheduler snapshot filters `status = 'READY'`; reserve `UPDATE … WHERE status = 'READY' AND
+    allocated + n <= capacity`
+  - integration test `TestPlaceSkipsNonReady` (NOT_READY and CORDONED excluded) and
+    `TestPlaceRefusesNodeTurnedNotReady`: node marked NOT_READY between snapshot and reserve (hook)
+    → falls back to the next node (fails if `status` is dropped from the reserve `WHERE`)
+  - `seed-nodes`, `gpucp_scheduler_fragmented_gpus` and other users switched to `status`;
+    `grep -rn schedulable internal cmd` finds only the migrations
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: who writes `status` (S2-18)
+
+### S2-18 (2 pts) — NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: inventory is discovered from Kubernetes, not typed in (D15); replaces the seed Job idea (D39)
+Design link: ADR-0002 §Node sync; Discussion D23, D39
+Depends on: S2-4, S2-17
+Acceptance:
+  - NodeReconciler registered on the Manager, own queue, `--node-workers=2`, shared Node informer;
+    Nodes without `gpu.example.com/type` ignored
+  - upsert by name: `gpu_type` (insert only), `capacity` from `status.capacity`, `failure_domain` from
+    the zone label, `last_seen`, `status` per ADR-0002 table; `status_changed_at` only on a change
+  - the upsert SQL never mentions `allocated`: `TestNodeSyncNeverTouchesAllocated` (row with
+    allocated 4 keeps 4 after sync)
+  - envtest `TestNodeSyncStatus`: Ready → READY; cordon → CORDONED; Ready=False → NOT_READY; back → READY
+  - re-syncing an unchanged Node writes nothing (`TestNodeSyncIdempotent`)
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: deleted nodes and conflicts (S2-19); PROBATION / QUARANTINED (M2b)
+
+### S2-19 (1 pt) — Node sync edge cases: deleted node, capacity below allocated, type change
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: these are the cases where a naive sync corrupts accounting or the fleet view (D39)
+Design link: ADR-0002 §Node sync, §Failure modes; Discussion D39
+Depends on: S2-18
+Acceptance:
+  - Node deleted → row kept, NOT_READY (`TestNodeDeletedMarksNotReady`); the row is never deleted
+  - sweep after WaitForCacheSync and every 5 min marks rows with no GPU Node NOT_READY
+    (`TestNodeSweepCatchesMissedDelete`); sweep does not run before cache sync
+  - capacity reported below `allocated` → capacity unchanged, other columns synced,
+    `gpucp_nodes_capacity_conflicts` = 1 (`TestNodeCapacityBelowAllocatedNotClobbered`)
+  - type label changed → stored type kept, `gpucp_nodes_type_conflicts` = 1
+  - `gpucp_nodes{gpu_type,status}` exposed
+Out of scope: waking that node's instances on Node events (M2b)
+
+### M2b epic (not split yet) — HA, nodes, drift
+- Leader election via Lease, 3 controller replicas; failover test (D22)
+- Node health policy on top of the M2a sync (S2-17 … S2-19): a node returning from NOT_READY goes
+  PROBATION, then READY after a quiet period; flapping → QUARANTINED until an operator clears it (D32)
+- Node informer also enqueues the node's instances via the CR `spec.nodeName` index (node NotReady
+  wakes its instances)
+- optional `source` column so the sweep can skip DB-only scale-test nodes (ADR-0002 Q4, if needed)
+- k8s/DB drift detection: orphan Pods, missing Pods, CR ≠ DB; metrics + repair toward the DB (D24)
+- S1-17 follow-ups: fail-fast 503 for bursts while the DB is down (test: zero 500s); seed-nodes
+  connect timeout; warn if `connect_timeout ≥ 10s`; parallelize black-hole subtests (D36)
+
+### M2c epic (not split yet) — Auto-recovery
+- RECOVERING state; `HoldsQuota` / `HoldsNode` split of invariant 7 (D33)
+- grace deadline on DB time; fence by force-deleting the old Pod; release old node, keep quota;
+  re-place with the same scheduler; `max_recoveries`
+- `recovery_policy` (`auto` default, `none` opt-out); `store.Recover` internal only
+- no capacity: stay RECOVERING, retry every 30s up to 10 min, then FAILED `no_capacity` and release quota

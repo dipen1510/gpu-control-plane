@@ -5,6 +5,8 @@ Two views:
    with the milestone that delivers it.
 2. **Milestone 1 only** — what exists after M1, tagged with the stories that
    build each box.
+3. **Milestone 2 (controller)** — black-and-white view of M2a, with M2b/M2c
+   parts tagged.
 
 Notation: solid arrows are calls/data flow, labelled with port and protocol.
 Dashed arrows are future (v2) or test-only paths. Cylinders are data stores.
@@ -265,3 +267,140 @@ PENDING is not shown: it is used only by the v2 queue.
 | Seed script for nodes | Queue and scheduler service (v2) |
 | Unit, integration and concurrency tests | |
 | `/metrics`, `/healthz`, `/readyz` endpoints | |
+
+---
+
+## 3. Milestone 2 (controller)
+
+Design: `docs/adr/0002-milestone-2-controller.md` (Proposed); reasoning:
+`docs/Discussion.md` D19–D36. Everything now runs **inside kind**. The API
+only creates (→ SCHEDULED) and requests deletion (→ TERMINATING); the
+controller does every other transition. Kubernetes objects are changed
+first, then the DB (D21). Tags: `[M2a]`, `[M2b]`, `[M2c]`, `[S2-n]`.
+
+```mermaid
+flowchart TB
+    classDef default fill:#ffffff,stroke:#000000,color:#000000
+
+    client(["Client<br/>curl / CLI"])
+    operator(["Operator<br/>kubectl · make deploy"])
+
+    subgraph kind["kind cluster gpu-cp [S2-1]"]
+
+        subgraph cp["control-plane node"]
+            kapi["kube-apiserver :6443"]
+            etcd[("etcd<br/>GPUInstance CRs · Pods · Leases")]
+            kapi --- etcd
+        end
+
+        subgraph ns["namespace gpucp · Helm chart [S2-14]"]
+            api["apiserver ×3<br/>POST → SCHEDULED · DELETE → TERMINATING<br/>no lifecycle driver [S2-12]"]
+            pg[("Postgres 16 · Helm + PVC [S2-3]<br/>instances (updated_at idx, expires_at)<br/>nodes (status READY / NOT_READY / CORDONED)<br/>tenant_quota · outbox")]
+            mig["migrate Job [S2-2 S2-3]"]
+
+            subgraph ctrl["controller · 1 replica [M2a] · 3 + Lease [M2b]"]
+                mgr["Manager<br/>shared informers → cache<br/>WaitForCacheSync"]
+                poll["DB poller [S2-5]<br/>1s: updated_at > last - 5s<br/>30s: all non-terminal ids"]
+                q["instance workqueue [S2-13]<br/>dedupe · backoff ≤ 5 min · RequeueAfter"]
+                ir["InstanceReconciler ×8 [S2-7..S2-11]<br/>create · run · delete · fail · TTL<br/>recovery [M2c]"]
+                nr["NodeReconciler ×2 [S2-18 S2-19]<br/>node sync · READY / NOT_READY / CORDONED<br/>probation · quarantine [M2b]"]
+                mgr -->|"Pod / CR / Node events → instance id"| q
+                poll -->|"ids via source.Channel"| q
+                q --> ir
+                mgr -->|"Node events → node name"| nr
+            end
+        end
+
+        subgraph gpu["GPU worker nodes ×4 · label type · gpu.example.com/gpu: 8"]
+            pod["Pod inst-x [S2-6]<br/>init: sleep BOOT_SECONDS or fail<br/>main: sleep infinity · preStop sleep<br/>ownerRef → GPUInstance"]
+        end
+    end
+
+    client -->|"HTTP :8080 port-forward"| api
+    api -->|"store.Create · store.Transition<br/>Place only on status = READY [S2-17]"| pg
+    mig --> pg
+    poll -->|"SELECT ids, now()"| pg
+    ir -->|"2nd: store.Transition<br/>1 tx + outbox + rv CAS"| pg
+    ir -->|"1st: CR + finalizer · Pod create/delete<br/>CR status from DB"| kapi
+    nr -->|"upsert inventory + status<br/>never allocated"| pg
+    mgr -->|"LIST then WATCH"| kapi
+    kapi -->|"kubelet runs Pod<br/>spec.nodeName pinned"| pod
+    operator --> kapi
+```
+
+### Create to RUNNING in M2
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as apiserver
+    participant P as Postgres
+    participant Q as poller + workqueue
+    participant R as InstanceReconciler
+    participant K as kube-apiserver
+
+    C->>A: POST /v1/instances
+    A->>P: create txn (key, quota, place, instance, outbox)
+    A-->>C: 202 SCHEDULED
+    Q->>P: SELECT id WHERE updated_at > last - 5s
+    Q->>R: Reconcile(inst_x)
+    R->>P: load row and db now
+    R->>K: create GPUInstance with finalizer (AlreadyExists is ok)
+    R->>K: create Pod pinned to node (AlreadyExists is ok)
+    R->>P: Transition SCHEDULED to PROVISIONING
+    R->>K: patch CR status from DB row
+    Note over K: init container sleeps 10 to 30 s
+    K-->>Q: Pod Ready event, key inst_x
+    Q->>R: Reconcile(inst_x)
+    R->>P: Transition PROVISIONING to RUNNING
+    C->>A: GET /v1/instances/inst_x
+    A-->>C: 200 RUNNING
+```
+
+### Delete in M2
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as apiserver
+    participant P as Postgres
+    participant R as InstanceReconciler
+    participant K as kube-apiserver
+
+    C->>A: DELETE /v1/instances/inst_x
+    A->>P: Transition to TERMINATING
+    A-->>C: 202 TERMINATING
+    R->>P: load row (state TERMINATING)
+    R->>K: delete Pod (NotFound is ok)
+    Note over K: preStop sleep then Pod gone
+    K-->>R: Pod deleted event
+    R->>K: live read confirms Pod is gone
+    R->>P: Transition to TERMINATED and release GPUs and quota
+    R->>K: delete CR and remove finalizer
+    C->>A: GET /v1/instances/inst_x
+    A-->>C: 200 TERMINATED
+```
+
+### Instance states in M2
+
+```mermaid
+stateDiagram-v2
+    classDef default fill:#ffffff,stroke:#000000,color:#000000
+    [*] --> SCHEDULED: API create
+    SCHEDULED --> PROVISIONING: controller, Pod created
+    PROVISIONING --> RUNNING: controller, Pod Ready
+    SCHEDULED --> TERMINATING: API DELETE or TTL
+    PROVISIONING --> TERMINATING: API DELETE or TTL
+    RUNNING --> TERMINATING: API DELETE or TTL
+    TERMINATING --> TERMINATED: controller, Pod gone, release
+    SCHEDULED --> FAILED: controller
+    PROVISIONING --> FAILED: boot_failed or provisioning_timeout
+    RUNNING --> FAILED: pod_lost (new in M2a)
+    TERMINATED --> [*]
+    FAILED --> [*]
+```
+
+M2c adds RECOVERING (RUNNING → RECOVERING → PROVISIONING, or → FAILED
+`no_capacity`); not shown until it is designed in stories.

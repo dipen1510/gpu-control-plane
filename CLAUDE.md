@@ -29,6 +29,7 @@ PENDING → SCHEDULED → PROVISIONING → RUNNING → TERMINATING → TERMINATE
    └───────────┴────────────┴──► FAILED  (terminal; capacity is released)
 
 also: SCHEDULED → TERMINATING, PROVISIONING → TERMINATING   (user deletes before RUNNING)
+      RUNNING → FAILED   (M2, S2-9: Pod or node lost; ADR-0002)
 ```
 Rules: transitions only move forward; every transition is a single DB
 transaction that also writes an outbox event; a terminal state never changes.
