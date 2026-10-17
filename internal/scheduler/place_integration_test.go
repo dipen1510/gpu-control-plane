@@ -422,6 +422,65 @@ func TestPlaceSpreadsTenantAcrossFailureDomains(t *testing.T) {
 	}
 }
 
+// TestPlaceSpreadCountsEveryHoldingState: an instance counts for the tenant's
+// failure-domain spread exactly while it holds capacity (CLAUDE.md: SCHEDULED,
+// PROVISIONING, RUNNING, TERMINATING). The states are listed here on purpose,
+// not taken from statemachine.HoldingStates(), so the test fails if the
+// snapshot query's list loses one (TERMINATING is the easy one to forget: its
+// GPUs are still reserved until the release step).
+//
+// Nodes a (rack-0) and b (rack-1) tie on best fit. The tenant's instance in
+// the state under test sits on a. Holding: rack-0 is taken, so b must win
+// every time. Not holding: the tenant also has a RUNNING instance on b, so a
+// must win every time. A wrong list turns either case into a coin flip, which
+// 20 runs catch with probability 1 - 2^-20.
+func TestPlaceSpreadCountsEveryHoldingState(t *testing.T) {
+	tests := []struct {
+		state string
+		want  NodeID
+	}{
+		{state: "SCHEDULED", want: "b"},
+		{state: "PROVISIONING", want: "b"},
+		{state: "RUNNING", want: "b"},
+		{state: "TERMINATING", want: "b"},
+		{state: "TERMINATED", want: "a"},
+		{state: "FAILED", want: "a"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.state, func(t *testing.T) {
+			db := testutil.NewDB(t)
+			insertNodes(t, db, h100Row("a", 4, "rack-0"), h100Row("b", 4, "rack-1"))
+			if _, err := db.Exec(t.Context(), `INSERT INTO instances
+				(id, tenant_id, gpu_type, gpu_count, node_id, state) VALUES
+				('i-under-test', 't1', 'H100', 4, 'a', $1)`, tc.state); err != nil {
+				t.Fatalf("insert instance: %v", err)
+			}
+			if tc.want == "a" {
+				if _, err := db.Exec(t.Context(), `INSERT INTO instances
+					(id, tenant_id, gpu_type, gpu_count, node_id, state) VALUES
+					('i-on-b', 't1', 'H100', 4, 'b', 'RUNNING')`); err != nil {
+					t.Fatalf("insert instance on b: %v", err)
+				}
+			}
+
+			s := New(nil)
+			for i := range 20 {
+				tx := begin(t, db)
+				got, err := s.Place(t.Context(), tx, h100Req(4))
+				if err != nil {
+					t.Fatalf("run %d: Place: %v", i, err)
+				}
+				if err := tx.Rollback(t.Context()); err != nil {
+					t.Fatalf("rollback: %v", err)
+				}
+				if got != tc.want {
+					t.Fatalf("run %d: Place = %s, want %s (tenant instance on a is %s)", i, got, tc.want, tc.state)
+				}
+			}
+		})
+	}
+}
+
 // Invariant 1 at the Place level: many transactions race for a small fleet
 // and the sum reserved on a node never exceeds its capacity. Each goroutine
 // runs its own transaction, as separate API replicas would.

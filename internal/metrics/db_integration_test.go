@@ -102,6 +102,47 @@ func TestAllocationDriftGauge(t *testing.T) {
 	}
 }
 
+// TestDriftZeroThroughLifecycle: an instance walked through every state by
+// the real store never shows as drift. Its GPUs stay in allocated until the
+// release step (TERMINATING → TERMINATED), so the drift query must count it as
+// held in each of SCHEDULED, PROVISIONING, RUNNING and TERMINATING; a holding
+// list that loses one (TERMINATING is the easy one to forget) reports 1 in
+// that state. The node's allocated is checked too, so the test cannot pass by
+// both sides being 0.
+func TestDriftZeroThroughLifecycle(t *testing.T) {
+	db, m := newCollected(t, `INSERT INTO nodes (id, gpu_type, capacity, failure_domain) VALUES ('n1', 'H100', 8, 'fd-a')`)
+	st := store.New(db, scheduler.New(nil))
+
+	inst := create(t, st, "inst_walk", "H100", 2)
+	steps := []struct {
+		to            statemachine.State
+		wantAllocated int
+	}{
+		{to: statemachine.Provisioning, wantAllocated: 2},
+		{to: statemachine.Running, wantAllocated: 2},
+		{to: statemachine.Terminating, wantAllocated: 2},
+		{to: statemachine.Terminated, wantAllocated: 0},
+	}
+	check := func(state statemachine.State, wantAllocated int) {
+		t.Helper()
+		if got := allocated(t, db, "n1"); got != wantAllocated {
+			t.Fatalf("allocated in %s = %d, want %d (test setup is wrong)", state, got, wantAllocated)
+		}
+		if got := count(gather(t, m), "gpucp_store_allocation_drift_nodes", ""); got != 0 {
+			t.Errorf("drift with the instance in %s = %v, want 0", state, got)
+		}
+	}
+	check(inst.State, 2) // SCHEDULED
+	for _, s := range steps {
+		next, err := st.Transition(t.Context(), inst.ID, s.to, inst.ResourceVersion, "")
+		if err != nil {
+			t.Fatalf("transition to %s: %v", s.to, err)
+		}
+		inst = next
+		check(inst.State, s.wantAllocated)
+	}
+}
+
 // TestNodeGaugesPerType: capacity, allocated and fragmentation are reported
 // per GPU type from the database.
 func TestNodeGaugesPerType(t *testing.T) {

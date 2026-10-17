@@ -78,7 +78,7 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Done |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Done |
 | S1-16 | 2 | M1 cleanup: review follow-ups | implementer | S1-13 | Done |
-| S1-17 | 1 | DB-down 503 everywhere + holding-states behavior tests | implementer | S1-16 | Proposed |
+| S1-17 | 1 | DB-down 503 everywhere + holding-states behavior tests | implementer | S1-16 | Done |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
@@ -86,7 +86,14 @@ the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
 
 ### S1-17 (1 pt) — DB-down 503 everywhere + holding-states behavior tests
-Owner: implementer        Reviewer: verifier        Status: Proposed
+Owner: implementer        Reviewer: verifier        Status: Done (verifier review 2026-10-17; ADR wording fixed before commit)
+Result: GET 503 on DB down; pool connect timeout default 2s (store.ParsePoolConfig) → black-holed DB answers
+503 in 2.0s; integration tests pin TERMINATING in both holding-state uses (spread, drift). 6/6 mutations caught.
+Review: CHANGES REQUESTED only for the ADR row — a burst while the DB is down still yields 500 for requests
+queued behind the pool (probe: 40 GETs → 24×500, 16×503). Row now states the limits.
+Follow-up for M2: fail fast with 503 while connects are failing (pool stats/hooks, no string matching) —
+test asserts zero 500s under a burst; cmd/seed-nodes reuse the pool config helper; warn at startup if
+connect_timeout ≥ 10s; parallelize the black-hole subtests (+6s to make test).
 Why: S1-16 review — GET still answers 500 when the DB is down; a black-holed DB times out at 10s as a
 500 (no connect timeout); and a wrong holding-states list in scheduler or metrics would pass all tests
 Depends on: S1-16

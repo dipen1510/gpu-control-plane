@@ -307,11 +307,16 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 	inst, err := h.store.Get(ctx, tenant, id)
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, codeNotFound, "instance "+id+" not found")
 		return
-	}
-	if err != nil {
+	case store.IsUnavailable(err):
+		// Same answer as create and DELETE (ADR-0001 §Failure modes): a
+		// polling client backs off and retries instead of seeing a 500.
+		h.unavailable(w, "get instance", err, "tenant", tenant, "instance_id", id)
+		return
+	case err != nil:
 		h.internalError(w, "get instance", err, "tenant", tenant, "instance_id", id)
 		return
 	}

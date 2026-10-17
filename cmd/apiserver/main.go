@@ -2,7 +2,9 @@
 // It applies pending migrations at startup (dev), then listens until SIGINT
 // or SIGTERM, and drains in-flight requests before exiting.
 //
-// Configuration: DATABASE_URL (required); listen address from -addr, else
+// Configuration: DATABASE_URL (required; a positive connect_timeout in it or
+// PGCONNECT_TIMEOUT is kept, else — including connect_timeout=0 — each connect
+// is bounded at 2s); listen address from -addr, else
 // the ADDR environment variable, else :8080. Besides /v1 it serves
 // /metrics, /healthz (process up) and /readyz (database reachable).
 package main
@@ -59,7 +61,14 @@ func run(log *slog.Logger, addr string) error {
 
 	startCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
-	pool, err := pgxpool.New(startCtx, url)
+	// Each new connection is bounded by connect_timeout from the DSN, else
+	// store.DefaultConnectTimeout (2s), so an unreachable database answers
+	// 503 well within a request's 10s budget instead of a 500 at its end.
+	poolCfg, err := store.ParsePoolConfig(url)
+	if err != nil {
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(startCtx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
