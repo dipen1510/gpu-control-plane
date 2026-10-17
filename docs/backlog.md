@@ -509,7 +509,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 
 | ID | Pts | Story | Owner | Depends on | Status |
 |---|---|---|---|---|---|
-| S2-1 | 1 | kind cluster: 4 fake GPU workers | deployer | — | Proposed |
+| S2-1 | 1 | kind cluster: 4 fake GPU workers | deployer | — | Done |
 | S2-2 | 1 | Container image and `cmd/migrate` | implementer | — | Done |
 | S2-3 | 2 | Postgres in kind via Helm + migrate Job | deployer | S2-1, S2-2 | Done |
 | S2-4 | 2 | kubebuilder scaffold, GPUInstance CRD, RBAC, `cmd/controller` | implementer | — | Done |
