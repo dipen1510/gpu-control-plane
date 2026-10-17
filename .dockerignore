@@ -1,0 +1,13 @@
+.git
+.claude
+docs
+deploy
+test
+Dockerfile
+.dockerignore
+.env
+.env.*
+kubeconfig*
+*.local.yaml
+bin/
+dist/

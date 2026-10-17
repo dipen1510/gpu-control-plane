@@ -96,3 +96,11 @@ kind-down:
 
 deploy:
 	@echo "deploy target is added in Milestone 2 (see deploy-kind skill)"; exit 1
+
+# Build one component's image from the shared Dockerfile (D26), e.g.
+# `make image CMD=migrate`. Tag: gpucp-<CMD>:$(TAG).
+TAG ?= dev
+.PHONY: image
+image:
+	@test -n "$(CMD)" || { echo "usage: make image CMD=<apiserver|controller|migrate>" >&2; exit 1; }
+	docker build --build-arg CMD=$(CMD) -t gpucp-$(CMD):$(TAG) .
