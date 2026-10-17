@@ -46,6 +46,8 @@ the controller in M2.
 3. **No lost events**: every committed state change produces exactly one outbox row; consumers dedupe by event ID.
 4. **Optimistic concurrency**: writes carry `resource_version`; stale writes are rejected, never silently applied.
 5. **Safe deletion**: an instance is not removed until its capacity is released (finalizer).
+6. **Quota under concurrency**: a tenant's GPUs in capacity-holding states never exceed its `quota_limit` per GPU type, even with N replicas (conditional `UPDATE tenant_quota` + CHECK).
+7. **Accounting matches**: `nodes.allocated` = SUM(`gpu_count`) of capacity-holding instances on that node, and `tenant_quota.used` likewise per tenant and type; drift is reported (`gpucp_store_allocation_drift_nodes`), never auto-fixed.
 
 ## Tech stack
 

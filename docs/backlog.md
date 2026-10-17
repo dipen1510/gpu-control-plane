@@ -55,7 +55,7 @@ Owner: architect        Reviewer: tech lead        Status: Done
 Result: ADR-0001 Amendment 2 (lost-race lock + savepoint; Transition check order and
 lock-then-CAS-then-release; API error codes and header limits; M3 outbox scan rule; invariants 6
 and 7 evidence) and docs/Discussion.md D18 "Lessons from review (concurrency)".
-Open: promote invariants 6 and 7 into CLAUDE.md after S1-11 lands (proposed, not done).
+Invariants 6 and 7 promoted into CLAUDE.md by the tech lead (2026-10-17), evidence: S1-11, S1-12.
 
 ### Milestone 1 stories (from ADR-0001)
 
@@ -77,11 +77,31 @@ Summary (details below). Integration tests need `make db-up` first.
 | S1-12 | 2 | Spec tests: idempotency races and state machine | test-engineer | S1-2 | Done |
 | S1-13 | 1 | M1 metrics and health endpoints | implementer | S1-7, S1-9 | Done |
 | S1-15 | 1 | `make lint` fails on real lint errors | implementer | — | Done |
+| S1-16 | 2 | M1 cleanup: review follow-ups | implementer | S1-13 | Proposed |
 | S1-14 | 1 | M1 instant lifecycle driver | implementer | S1-9 | Done |
 
 S1-1, S1-2 and S1-4 can start in parallel. S1-11 and S1-12 are written from
 the ADR in parallel with S1-5…S1-10 and S1-14 and are expected to fail until
 those land.
+
+### S1-16 (2 pts) — M1 cleanup: review follow-ups
+Owner: implementer (docs part: architect)        Reviewer: verifier        Status: Proposed
+Why: close the gaps reviews found in M1 so M2 starts from a clean base; two of them are behaviors no test guards
+Depends on: S1-13
+Acceptance:
+  - test: a Transition that loses its CAS adds 0 to `gpucp_instance_transitions_total`
+    (fails if the counter moves before the CAS)
+  - test: DELETE where TERMINATING committed and the release step hits SQLSTATE 40P01 → 202, not 503
+    (fails if the deadlock case is checked before the committed-TERMINATING branches)
+  - create (and DELETE) with the DB unreachable → 503 (ADR §Failure modes), not 500; test with a closed pool
+  - `promLogger` logs a readable error string, not `{}`; test asserts the message text
+  - `statemachine` exports the capacity-holding state list; scheduler and metrics use it (no copies)
+  - Transition "refuse to release if the returned row differs" branch has an in-repo test (S1-9 follow-up)
+  - testutil skip message says 127.0.0.1, not localhost (S1-15 follow-up)
+  - ADR-0001 amendment (architect): 503 conflict_retry + Retry-After: 1, extra create results
+    (invalid, conflict_retry, error), stuck-TERMINATING gauge, DB-down 503
+  - `make test`, `make lint`, `make test-integration` pass
+Out of scope: /metrics on a separate port or in-flight limit (M2); new features
 
 ### S1-15 (1 pt) — `make lint` fails on real lint errors
 Owner: implementer        Reviewer: verifier        Status: Done (verifier APPROVE 2026-10-16)
@@ -89,7 +109,7 @@ Result: lint = gofmt check + go vet + staticcheck, each plain and with -tags=int
 or missing staticcheck fails. golangci-lint removed (no extra linters enabled; can't run on Go 1.26).
 test-integration runs with -p 2 (closes the S1-11 max_connections follow-up). DATABASE_URL default
 is 127.0.0.1 (localhost may resolve to ::1 and miss the container's IPv4 port).
-Deviations (pending tech-lead OK): gofmt check added. Follow-ups: testutil skip message still says
+Deviation accepted by tech lead (2026-10-17): gofmt check added. Follow-ups: testutil skip message still says
 localhost; gofmt step ignores gofmt's own exit status (vet catches parse errors).
 Why: today `command -v staticcheck && staticcheck ./... || echo …` succeeds even when staticcheck
 reports problems, and `golangci-lint … || true` hides that it can't run on Go 1.26 — a lint step
