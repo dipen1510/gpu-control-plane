@@ -2,16 +2,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/dipen1510/gpu-control-plane/internal/controller"
+	"github.com/dipen1510/gpu-control-plane/internal/store"
 )
 
 func main() {
@@ -44,6 +48,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
+	// Postgres for node sync (S2-18). Migrations are applied by the migrate
+	// Job (D26), not here.
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return errors.New("DATABASE_URL is not set")
+	}
+	poolCfg, err := store.ParsePoolConfig(dbURL)
+	if err != nil {
+		return err
+	}
+	if opts.DBMaxConns <= 0 {
+		opts.DBMaxConns = controller.DefaultDBMaxConns // 0 means default, as for every sizing flag
+	}
+	poolCfg.MaxConns = opts.DBMaxConns
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		return fmt.Errorf("open database pool: %w", err)
+	}
+	defer pool.Close()
+	opts.Nodes = store.New(pool, nil)
+
 	mgr, err := controller.NewManager(cfg, opts)
 	if err != nil {
 		return err

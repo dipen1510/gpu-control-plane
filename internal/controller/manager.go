@@ -35,6 +35,10 @@ type Options struct {
 	DBMaxConns      int32   // pgxpool MaxConns for the controller's DB pool
 	KubeQPS         float32 // client-go QPS to the API server
 	KubeBurst       int     // client-go burst to the API server
+
+	// Nodes is where the NodeReconciler writes inventory rows (S2-18). Nil
+	// skips registering it (tests that run no Postgres).
+	Nodes NodeSyncer
 }
 
 // withDefaults fills zero sizing fields with the Default* constants.
@@ -105,6 +109,12 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 	}
 	if err := (&InstanceReconciler{Workers: opts.InstanceWorkers, Metrics: m}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup instance reconciler: %w", err)
+	}
+	if opts.Nodes != nil {
+		nr := &NodeReconciler{Reader: mgr.GetClient(), Nodes: opts.Nodes, Workers: opts.NodeWorkers}
+		if err := nr.SetupWithManager(mgr); err != nil {
+			return nil, fmt.Errorf("setup node reconciler: %w", err)
+		}
 	}
 	return mgr, nil
 }
