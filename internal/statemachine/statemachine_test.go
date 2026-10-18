@@ -22,6 +22,7 @@ var legalEdges = map[edge]bool{
 	{Pending, Failed}:           true,
 	{Scheduled, Failed}:         true,
 	{Provisioning, Failed}:      true,
+	{Running, Failed}:           true, // D29, S2-9: Pod or node lost
 	{Scheduled, Terminating}:    true,
 	{Provisioning, Terminating}: true,
 }

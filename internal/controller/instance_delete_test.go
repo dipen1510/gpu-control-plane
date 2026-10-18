@@ -569,3 +569,46 @@ func TestDeletePathConfirmsGoneLive(t *testing.T) {
 		})
 	}
 }
+
+// TestRunningForeignPodLostThenCleanedUp: S2-9 and S2-8 agree on one Pod
+// across reconciles (D42). RUNNING with a Ready Pod that does not belong to
+// the instance → FAILED pod_lost (S2-9) → terminal cleanup removes the CR
+// (S2-8) → later passes are no-ops. The foreign Pod is never deleted.
+func TestRunningForeignPodLostThenCleanedUp(t *testing.T) {
+	for _, tc := range ownerCases() {
+		if tc.ours {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			row := scheduledRow()
+			row.State = statemachine.Running
+			st := &recStore{row: row}
+			r := newFakeReconciler(t, st)
+			deleteFixture(t, r, row, false)
+			createPodOwnedBy(t, r, row, tc.set)
+			p, _ := r.testGetPod(t)
+			p.Status = corev1.PodStatus{Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
+			if err := r.Client.Status().Update(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+
+			const passes = 4
+			for i := range passes {
+				if _, err := r.Reconcile(t.Context(), deleteReq); err != nil {
+					t.Fatalf("reconcile pass %d: %v", i+1, err)
+				}
+				assertNotDeleted(t, r)
+			}
+			if got := st.transitions(); !slices.Equal(got, []statemachine.State{statemachine.Failed}) {
+				t.Fatalf("transitions = %v, want exactly [FAILED]", got)
+			}
+			if st.why[0] != ReasonPodLost {
+				t.Errorf("reason = %q, want %q", st.why[0], ReasonPodLost)
+			}
+			if _, ok := r.testGetCR(t); ok {
+				t.Error("CR still present after FAILED")
+			}
+		})
+	}
+}

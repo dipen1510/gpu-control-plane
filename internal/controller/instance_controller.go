@@ -186,11 +186,7 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, inst store.I
 		}
 		return ctrl.Result{}, r.transition(ctx, cr, inst, statemachine.Running)
 	case statemachine.Running:
-		cr, err := r.ensureCR(ctx, inst)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, r.syncStatus(ctx, cr, inst)
+		return r.reconcileRunning(ctx, inst) // S2-9: pod_lost (instance_running.go)
 	case statemachine.Terminating:
 		return r.reconcileTerminating(ctx, inst) // S2-8 (instance_delete.go)
 	case statemachine.Terminated, statemachine.Failed:
@@ -204,15 +200,33 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, inst store.I
 // transition commits inst → to through store.Transition (outbox + rv CAS),
 // counts it, then mirrors the returned row into the CR status.
 func (r *InstanceReconciler) transition(ctx context.Context, cr *gpuv1alpha1.GPUInstance, inst store.Instance, to statemachine.State) error {
-	next, err := r.Store.Transition(ctx, inst.ID, to, inst.ResourceVersion, "")
+	return r.transitionWithReason(ctx, cr, inst, to, "")
+}
+
+// transitionWithReason is transition with a failure_reason (e.g. pod_lost),
+// recorded on the row and as the metric's reason label.
+func (r *InstanceReconciler) transitionWithReason(ctx context.Context, cr *gpuv1alpha1.GPUInstance, inst store.Instance, to statemachine.State, reason string) error {
+	next, err := r.commitWithReason(ctx, inst, to, reason)
 	if err != nil {
-		return fmt.Errorf("reconcile %s: %w", inst.ID, err)
+		return err
+	}
+	return r.syncStatus(ctx, cr, next)
+}
+
+// commitWithReason is the DB half of transitionWithReason: store.Transition
+// (outbox + rv CAS), counted and logged, without the CR status patch. Callers
+// that must record something exactly once per committed transition do it
+// between this and syncStatus, so a failed patch cannot skip it.
+func (r *InstanceReconciler) commitWithReason(ctx context.Context, inst store.Instance, to statemachine.State, reason string) (store.Instance, error) {
+	next, err := r.Store.Transition(ctx, inst.ID, to, inst.ResourceVersion, reason)
+	if err != nil {
+		return store.Instance{}, fmt.Errorf("reconcile %s: %w", inst.ID, err)
 	}
 	if r.Metrics != nil {
-		r.Metrics.Transitions.WithLabelValues(string(inst.State), string(to), "").Inc()
+		r.Metrics.Transitions.WithLabelValues(string(inst.State), string(to), reason).Inc()
 	}
-	logf.FromContext(ctx).Info("transitioned", "from", inst.State, "to", to, "new_rv", next.ResourceVersion)
-	return r.syncStatus(ctx, cr, next)
+	logf.FromContext(ctx).Info("transitioned", "from", inst.State, "to", to, "reason", reason, "new_rv", next.ResourceVersion)
+	return next, nil
 }
 
 // ensureCR returns the instance's GPUInstance, creating it (with finalizer)

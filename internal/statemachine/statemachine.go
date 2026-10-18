@@ -45,9 +45,9 @@ var transitions = map[State][]State{
 	// before it ever reaches Running.
 	Scheduled:    {Provisioning, Terminating, Failed},
 	Provisioning: {Running, Terminating, Failed},
-	// Running has no edge to Failed: once running, the instance ends through
-	// Terminating so shutdown and release follow one path.
-	Running:     {Terminating},
+	// Running → Failed: the Pod or its node was lost (pod_lost, ADR-0002
+	// D29), so the end is recorded as a failure, not as a user delete.
+	Running:     {Terminating, Failed},
 	Terminating: {Terminated},
 	// Terminated and Failed have no outgoing edges: a terminal state never
 	// changes, so a late or retried write can never revive an instance whose

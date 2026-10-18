@@ -99,11 +99,11 @@ func specTable() []specCase {
 			extra: "updated_at = now() - interval '1 minute'", podWant: podUnchanged},
 
 		// RUNNING: Pod missing (live read) or Failed → delete Pod → FAILED pod_lost.
-		{name: "RUNNING/absent: FAILED pod_lost", db: R, pod: podAbsent, pending: "S2-9",
+		{name: "RUNNING/absent: FAILED pod_lost", db: R, pod: podAbsent,
 			want: F, wantReason: "pod_lost", events: []statemachine.State{F}, podWant: podGone},
 		{name: "RUNNING/pending: no write", db: R, pod: podPending, podWant: podUnchanged},
 		{name: "RUNNING/ready: idempotent, no write", db: R, pod: podReady, podWant: podUnchanged},
-		{name: "RUNNING/failed: delete Pod, FAILED pod_lost", db: R, pod: podInitFailed, pending: "S2-9",
+		{name: "RUNNING/failed: delete Pod, FAILED pod_lost", db: R, pod: podInitFailed,
 			want: F, wantReason: "pod_lost", events: []statemachine.State{F}, podWant: podGone},
 		{name: "RUNNING/deleting: capacity held until Pod is gone", db: R, pod: podDeleting, podWant: podUnchanged},
 
@@ -363,12 +363,16 @@ func (e *specEnv) assertCreatedObjects(t *testing.T, f fixture) {
 
 // TestSpecRestartOverExistingObjects: a new Manager over Pods and rows that
 // already exist (a crash or upgrade) creates no duplicate Pods and fails no
-// healthy instance. This is what WaitForCacheSync + the live read before
-// "Pod missing" protect (ADR-0002 §Under the hood 4, §Failure modes).
+// healthy instance (ADR-0002 §Under the hood 4, §Failure modes).
 //
-// Re-check when S2-9 lands: until the controller can fail a RUNNING instance
-// (pod_lost), the "no wrong FAILED" half passes trivially; only with S2-9 does
-// an empty-cache or cache-only read actually get the chance to fail them.
+// It guards against a cold cache: if workers ran before WaitForCacheSync, an
+// empty cache would show "no Pod" for every RUNNING instance and S2-9's
+// pod_lost path would fail them all. It does NOT guard against a cache-only
+// read (skipping the live read before "Pod missing"): controller-runtime's
+// cache Get blocks until the Pod informer has synced, so after a restart the
+// cache already holds every Pod and such a mutant passes here (S2-9 verified
+// it, 3/3 runs). The live read is covered by TestPodLostUsesLiveRead, which
+// makes the cache and the API server disagree.
 func TestSpecRestartOverExistingObjects(t *testing.T) {
 	e := newSpecEnv(t)
 	const nRunning, nProvisioning, nScheduled = 20, 10, 10

@@ -48,7 +48,7 @@ var s112Spec = map[statemachine.State][]statemachine.State{
 	statemachine.Pending:      {statemachine.Scheduled, statemachine.Failed},
 	statemachine.Scheduled:    {statemachine.Provisioning, statemachine.Terminating, statemachine.Failed},
 	statemachine.Provisioning: {statemachine.Running, statemachine.Terminating, statemachine.Failed},
-	statemachine.Running:      {statemachine.Terminating},
+	statemachine.Running:      {statemachine.Terminating, statemachine.Failed}, // D29, S2-9
 	statemachine.Terminating:  {statemachine.Terminated},
 	statemachine.Terminated:   nil,
 	statemachine.Failed:       nil,
