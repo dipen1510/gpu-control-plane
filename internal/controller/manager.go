@@ -9,6 +9,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	gpuv1alpha1 "github.com/dipen1510/gpu-control-plane/api/v1alpha1"
@@ -27,6 +28,33 @@ type Options struct {
 	// controller name check. Tests only (several Managers in one process);
 	// cmd/controller leaves it false.
 	SkipNameValidation bool
+
+	// Sizing (ADR-0002 M2-16). Zero means the Default* constant.
+	InstanceWorkers int     // MaxConcurrentReconciles for GPUInstance
+	NodeWorkers     int     // MaxConcurrentReconciles for Node (S2-18)
+	DBMaxConns      int32   // pgxpool MaxConns for the controller's DB pool
+	KubeQPS         float32 // client-go QPS to the API server
+	KubeBurst       int     // client-go burst to the API server
+}
+
+// withDefaults fills zero sizing fields with the Default* constants.
+func (o Options) withDefaults() Options {
+	if o.InstanceWorkers <= 0 {
+		o.InstanceWorkers = DefaultInstanceWorkers
+	}
+	if o.NodeWorkers <= 0 {
+		o.NodeWorkers = DefaultNodeWorkers
+	}
+	if o.DBMaxConns <= 0 {
+		o.DBMaxConns = DefaultDBMaxConns
+	}
+	if o.KubeQPS <= 0 {
+		o.KubeQPS = DefaultKubeQPS
+	}
+	if o.KubeBurst <= 0 {
+		o.KubeBurst = DefaultKubeBurst
+	}
+	return o
 }
 
 // NewScheme returns a scheme with the built-in types and GPUInstance.
@@ -48,6 +76,10 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts = opts.withDefaults()
+	cfg = rest.CopyConfig(cfg)
+	cfg.QPS = opts.KubeQPS
+	cfg.Burst = opts.KubeBurst
 	skipNameValidation := opts.SkipNameValidation
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                  s,
@@ -67,7 +99,11 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		return nil, fmt.Errorf("add readyz: %w", err)
 	}
-	if err := (&InstanceReconciler{}).SetupWithManager(mgr); err != nil {
+	m, err := NewMetrics(crmetrics.Registry)
+	if err != nil {
+		return nil, err
+	}
+	if err := (&InstanceReconciler{Workers: opts.InstanceWorkers, Metrics: m}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup instance reconciler: %w", err)
 	}
 	return mgr, nil

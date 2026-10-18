@@ -7,6 +7,7 @@ import (
 	"context"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 
 	gpuv1alpha1 "github.com/dipen1510/gpu-control-plane/api/v1alpha1"
 )
@@ -24,7 +25,12 @@ import (
 
 // InstanceReconciler drives a GPUInstance through its lifecycle. It is a
 // no-op until S2-7.
-type InstanceReconciler struct{}
+type InstanceReconciler struct {
+	// Workers is MaxConcurrentReconciles; zero means DefaultInstanceWorkers.
+	Workers int
+	// Metrics receives gpucp_controller_* observations; may be nil in tests.
+	Metrics *Metrics
+}
 
 // Reconcile does nothing yet and never requeues.
 func (r *InstanceReconciler) Reconcile(_ context.Context, _ ctrl.Request) (ctrl.Result, error) {
@@ -36,5 +42,9 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gpuv1alpha1.GPUInstance{}).
 		Named("gpuinstance").
+		WithOptions(crcontroller.Options{
+			MaxConcurrentReconciles: workersOrDefault(r.Workers, DefaultInstanceWorkers),
+			RateLimiter:             NewRateLimiter(),
+		}).
 		Complete(r)
 }

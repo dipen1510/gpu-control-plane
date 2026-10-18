@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -26,7 +27,16 @@ func run() error {
 	flag.StringVar(&opts.ProbeAddr, "health-probe-bind-address", ":8082", "address for /healthz and /readyz")
 	flag.BoolVar(&opts.LeaderElection, "leader-elect", false, "enable leader election (Lease); off in M2a (1 replica)")
 	flag.StringVar(&opts.LeaderElectionNS, "leader-election-namespace", "", "namespace of the leader Lease (default: in-cluster namespace)")
+	flag.IntVar(&opts.InstanceWorkers, "instance-workers", controller.DefaultInstanceWorkers, "concurrent GPUInstance reconciles")
+	flag.IntVar(&opts.NodeWorkers, "node-workers", controller.DefaultNodeWorkers, "concurrent Node reconciles")
+	var dbMaxConns int
+	flag.IntVar(&dbMaxConns, "db-max-conns", controller.DefaultDBMaxConns, "max Postgres connections in the controller pool")
+	var kubeQPS float64
+	flag.Float64Var(&kubeQPS, "kube-api-qps", controller.DefaultKubeQPS, "client-go QPS to the Kubernetes API server")
+	flag.IntVar(&opts.KubeBurst, "kube-api-burst", controller.DefaultKubeBurst, "client-go burst to the Kubernetes API server")
 	flag.Parse()
+	opts.DBMaxConns = int32(min(max(dbMaxConns, 0), math.MaxInt32))
+	opts.KubeQPS = float32(kubeQPS)
 
 	ctrl.SetLogger(zap.New())
 
@@ -38,7 +48,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	slog.Info("starting controller manager", "metrics", opts.MetricsAddr, "probes", opts.ProbeAddr, "leader_elect", opts.LeaderElection)
+	slog.Info("starting controller manager", "metrics", opts.MetricsAddr, "probes", opts.ProbeAddr, "leader_elect", opts.LeaderElection,
+		"instance_workers", opts.InstanceWorkers, "node_workers", opts.NodeWorkers, "kube_qps", opts.KubeQPS, "kube_burst", opts.KubeBurst)
 	// SetupSignalHandler cancels on SIGTERM/SIGINT; Start drains the
 	// controllers (GracefulShutdownTimeout, 30s default) before returning.
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
