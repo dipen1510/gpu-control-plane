@@ -528,6 +528,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 | S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Done |
 | S2-18 | 2 | NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED | implementer | S2-4, S2-17 | Done |
 | S2-19 | 1 | Node sync edge cases: deleted node, capacity below allocated, type change | implementer | S2-18 | Done |
+| S2-20 | 1 | Node status independent of event order: never-known capacity stays NOT_READY (D41) | implementer | S2-19 | Proposed |
 
 S2-1, S2-2, S2-4 and S2-17 can start in parallel. S2-15 is written from the ADR in parallel with
 S2-7 … S2-11 and is expected to fail until they land.
@@ -822,6 +823,22 @@ Acceptance:
   - type label changed → stored type kept, `gpucp_nodes_type_conflicts` = 1
   - `gpucp_nodes{gpu_type,status}` exposed
 Out of scope: waking that node's instances on Node events (M2b)
+
+### S2-20 (1 pt) — Node status independent of event order (D41)
+Owner: implementer        Reviewer: verifier        Status: Proposed
+Why: today a Node that is Ready before its kubelet reports GPU capacity ends READY/0 or NOT_READY/0
+depending on which event the reconciler saw first (found while fixing the S2-19 flaky test). A
+level-triggered sync must map one observed state to one row.
+Design link: ADR-0002 §Node sync; Discussion D39, D41
+Depends on: S2-19
+Acceptance:
+  - the DB can tell "capacity never known" from "known 0" (e.g. nullable capacity or a flag; migration 0009)
+  - a row whose capacity has never been known is NOT_READY regardless of Ready, until capacity is reported;
+    then status follows the D39 table
+  - an existing row whose capacity disappears keeps its stored capacity and status follows Ready (unchanged)
+  - envtest: same final row for both event orders (bare Node then status, and status-first), and after one
+    extra unrelated Node event
+  - placement still never uses such a node; invariants 1 and 7 hold; node SQL never mentions `allocated`
 
 ### M2b epic (not split yet) — HA, nodes, drift
 - Leader election via Lease, 3 controller replicas; failover test (D22)

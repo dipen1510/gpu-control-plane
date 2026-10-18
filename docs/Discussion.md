@@ -702,6 +702,7 @@ numbered M2-1 … M2-16 in the meeting). Same format as above. ADR-0002
 | D38 | ADR-0002 Q3 | Terminal CRs | Controller deletes the CR once the row is TERMINATED or FAILED; Postgres keeps history |
 | D39 | ADR-0002 Q2 | Node sync timing | Basic node sync moves **into M2a** (READY / NOT_READY / CORDONED); probation, quarantine, flapping stay in M2b |
 | D40 | S2-5 review | Queue key → instance id | Stored generated column `instances.k8s_name = replace(id,'_','-')`, UNIQUE + indexed; Reconcile looks rows up by it |
+| D41 | S2-19 flake | Node with never-known capacity | Stays NOT_READY until capacity is reported, whatever the event order (S2-20) |
 
 ---
 
@@ -1190,4 +1191,19 @@ reversed, because two ids could map to one name.
 time, so the lookup can never be ambiguous. It is indexed, so it is one fast
 query, and Postgres computes the column itself, so no code can write a wrong
 value. Cost: one more column and migration.
+
+## D41 — A node whose GPU capacity was never reported (S2-19 follow-up)
+
+**Question.** A Node can be Ready before its kubelet reports `gpu.example.com/gpu`. Depending on which
+event the controller saw first, the row ended READY/0 or NOT_READY/0. Which is right?
+
+**Options.** A: a row whose capacity has never been known stays NOT_READY until capacity is reported.
+B: drop the special case; status simply follows Ready (READY/0 for a few seconds).
+
+**Decision: A** (tech lead, 2026-10-18), story S2-20.
+
+**Why.** A controller must be level-triggered: the same observed state gives the same row, whatever
+the event history. With A, READY always means "can take work", the READY node metric is honest, and
+`status_changed_at` is not stamped before the node is usable (which the M2b probation clock relies on).
+Safety was never at risk: placement needs `allocated + n <= capacity`, so nothing fits into 0.
 
