@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/dipen1510/gpu-control-plane/internal/controller"
+	"github.com/dipen1510/gpu-control-plane/internal/controller/poller"
 	"github.com/dipen1510/gpu-control-plane/internal/store"
 )
 
@@ -38,6 +39,9 @@ func run() error {
 	var kubeQPS float64
 	flag.Float64Var(&kubeQPS, "kube-api-qps", controller.DefaultKubeQPS, "client-go QPS to the Kubernetes API server")
 	flag.IntVar(&opts.KubeBurst, "kube-api-burst", controller.DefaultKubeBurst, "client-go burst to the Kubernetes API server")
+	flag.DurationVar(&opts.PollInterval, "poll-interval", poller.DefaultInterval, "DB poller: how often to fetch recently updated instance ids")
+	flag.StringVar(&opts.InstanceNamespace, "instance-namespace", controller.DefaultInstanceNamespace, "namespace of GPUInstance CRs (poller ids are keyed into it)")
+	flag.DurationVar(&opts.PollResyncInterval, "poll-resync-interval", poller.DefaultResyncInterval, "DB poller: how often to enqueue every non-terminal instance id")
 	flag.Parse()
 	opts.DBMaxConns = int32(min(max(dbMaxConns, 0), math.MaxInt32))
 	opts.KubeQPS = float32(kubeQPS)
@@ -68,6 +72,7 @@ func run() error {
 	}
 	defer pool.Close()
 	opts.Nodes = store.New(pool, nil)
+	opts.PollDB = pool
 
 	mgr, err := controller.NewManager(cfg, opts)
 	if err != nil {

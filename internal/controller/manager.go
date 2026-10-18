@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -13,10 +14,18 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	gpuv1alpha1 "github.com/dipen1510/gpu-control-plane/api/v1alpha1"
+	"github.com/dipen1510/gpu-control-plane/internal/controller/poller"
 )
 
 // LeaderElectionID is the Lease name used when leader election is enabled.
 const LeaderElectionID = "gpucp-controller.gpu.example.com"
+
+// pollerBuffer bounds the poller → workqueue channel. A full channel makes
+// the poller wait (backpressure); ids are never dropped.
+const pollerBuffer = 1024
+
+// DefaultInstanceNamespace is the namespace of GPUInstance CRs.
+const DefaultInstanceNamespace = "gpucp"
 
 // Options configures NewManager.
 type Options struct {
@@ -36,6 +45,18 @@ type Options struct {
 	KubeQPS         float32 // client-go QPS to the API server
 	KubeBurst       int     // client-go burst to the API server
 
+	// PollDB is what the DB poller reads instance ids from (S2-5). Nil skips
+	// the poller (tests that run no Postgres). Zero intervals take the
+	// poller.Default* values.
+	PollDB             poller.DB
+	PollInterval       time.Duration
+	PollResyncInterval time.Duration
+	// InstanceNamespace is where GPUInstance CRs live. Poller ids are mapped
+	// to {InstanceNamespace, K8sName(id)}, the same key the informer queues,
+	// so one instance is never reconciled by two workers at once. Empty
+	// means DefaultInstanceNamespace.
+	InstanceNamespace string
+
 	// Nodes is where the NodeReconciler writes inventory rows (S2-18). Nil
 	// skips registering it (tests that run no Postgres).
 	Nodes NodeSyncer
@@ -43,6 +64,9 @@ type Options struct {
 
 // withDefaults fills zero sizing fields with the Default* constants.
 func (o Options) withDefaults() Options {
+	if o.InstanceNamespace == "" {
+		o.InstanceNamespace = DefaultInstanceNamespace
+	}
 	if o.InstanceWorkers <= 0 {
 		o.InstanceWorkers = DefaultInstanceWorkers
 	}
@@ -107,7 +131,21 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := (&InstanceReconciler{Workers: opts.InstanceWorkers, Metrics: m}).SetupWithManager(mgr); err != nil {
+	var pollEvents chan poller.Event
+	if opts.PollDB != nil {
+		// Bounded; the poller is the only sender and closes it on exit.
+		pollEvents = make(chan poller.Event, pollerBuffer)
+		p, err := poller.New(opts.PollDB, pollEvents, poller.Config{
+			Interval: opts.PollInterval, ResyncInterval: opts.PollResyncInterval,
+		}, crmetrics.Registry, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := mgr.Add(p); err != nil {
+			return nil, fmt.Errorf("add db poller: %w", err)
+		}
+	}
+	if err := (&InstanceReconciler{Workers: opts.InstanceWorkers, Metrics: m, PollerEvents: pollEvents, Namespace: opts.InstanceNamespace}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup instance reconciler: %w", err)
 	}
 	if opts.Nodes != nil {
