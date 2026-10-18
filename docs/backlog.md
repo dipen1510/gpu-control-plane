@@ -527,7 +527,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 | S2-16 | 2 | End-to-end lifecycle tests on kind | test-engineer | S2-14, S2-19 | Proposed |
 | S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Done |
 | S2-18 | 2 | NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED | implementer | S2-4, S2-17 | Done |
-| S2-19 | 1 | Node sync edge cases: deleted node, capacity below allocated, type change | implementer | S2-18 | Proposed |
+| S2-19 | 1 | Node sync edge cases: deleted node, capacity below allocated, type change | implementer | S2-18 | Done |
 
 S2-1, S2-2, S2-4 and S2-17 can start in parallel. S2-15 is written from the ADR in parallel with
 S2-7 … S2-11 and is expected to fail until they land.

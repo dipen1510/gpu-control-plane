@@ -60,6 +60,9 @@ type Options struct {
 	// Nodes is where the NodeReconciler writes inventory rows (S2-18). Nil
 	// skips registering it (tests that run no Postgres).
 	Nodes NodeSyncer
+	// NodeSweepInterval is the period of the node sweep (S2-19). Zero means
+	// DefaultNodeSweepInterval.
+	NodeSweepInterval time.Duration
 }
 
 // withDefaults fills zero sizing fields with the Default* constants.
@@ -149,9 +152,17 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 		return nil, fmt.Errorf("setup instance reconciler: %w", err)
 	}
 	if opts.Nodes != nil {
-		nr := &NodeReconciler{Reader: mgr.GetClient(), Nodes: opts.Nodes, Workers: opts.NodeWorkers}
+		nm, err := NewNodeMetrics(crmetrics.Registry, opts.Nodes)
+		if err != nil {
+			return nil, err
+		}
+		nr := &NodeReconciler{Reader: mgr.GetClient(), Nodes: opts.Nodes, Metrics: nm, Workers: opts.NodeWorkers}
 		if err := nr.SetupWithManager(mgr); err != nil {
 			return nil, fmt.Errorf("setup node reconciler: %w", err)
+		}
+		sweep := &NodeSweeper{Cache: mgr.GetCache(), Reader: mgr.GetClient(), Nodes: opts.Nodes, Interval: opts.NodeSweepInterval}
+		if err := mgr.Add(sweep); err != nil {
+			return nil, fmt.Errorf("add node sweep: %w", err)
 		}
 	}
 	return mgr, nil

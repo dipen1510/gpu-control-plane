@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -23,61 +24,107 @@ const (
 	ResourceGPU  corev1.ResourceName = "gpu.example.com/gpu"
 )
 
-// NodeSyncer writes one node's inventory row. *store.Store satisfies it.
+// NodeSyncer writes node inventory rows. *store.Store satisfies it. None of
+// its methods writes nodes.allocated (D15).
 type NodeSyncer interface {
-	SyncNode(ctx context.Context, obs store.NodeObservation) (bool, error)
+	SyncNode(ctx context.Context, obs store.NodeObservation) (store.NodeSyncResult, error)
+	MarkNodeNotReady(ctx context.Context, name string) (bool, error)
+	SweepNodes(ctx context.Context, present []string) ([]string, error)
+	NodeCounts(ctx context.Context) ([]store.NodeCount, error)
 }
 
 // NodeReconciler mirrors Kubernetes GPU Nodes into the nodes table (ADR-0002
 // §Node sync, D39). It has its own queue (key = node name) and reads Nodes
 // from the Manager's shared informer. It never writes nodes.allocated.
-// Deleted Nodes and conflicts are S2-19; here a missing Node is a no-op.
+// A deleted Node, or one that lost its GPU type label, keeps its row and is
+// marked NOT_READY (S2-19).
 type NodeReconciler struct {
 	Reader  client.Reader // the Manager's cache-backed client
 	Nodes   NodeSyncer
-	Workers int // <= 0 means DefaultNodeWorkers
+	Metrics *NodeMetrics // nil: conflicts are only logged
+	Workers int          // <= 0 means DefaultNodeWorkers
 }
 
-// Reconcile upserts the row for one GPU Node.
+// Reconcile upserts the row for one GPU Node, or marks it NOT_READY when the
+// Node is gone or no longer carries the GPU type label.
 func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var node corev1.Node
 	if err := r.Reader.Get(ctx, req.NamespacedName, &node); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil // deleted Node: S2-19
+			return ctrl.Result{}, r.markNotReady(ctx, req.Name, "node deleted")
 		}
 		return ctrl.Result{}, fmt.Errorf("get node %s: %w", req.Name, err)
 	}
 	obs, ok := observeNode(&node)
 	if !ok {
-		return ctrl.Result{}, nil
+		// Only reaches here if the label was just removed (the predicate
+		// passes updates where the old object had it); no row → no-op.
+		return ctrl.Result{}, r.markNotReady(ctx, req.Name, "gpu type label removed")
 	}
-	wrote, err := r.Nodes.SyncNode(ctx, obs)
+	res, err := r.Nodes.SyncNode(ctx, obs)
 	if err != nil {
 		return ctrl.Result{}, err // the queue retries with backoff
 	}
-	if wrote {
-		log.FromContext(ctx).Info("node synced", "node", obs.Name, "status", obs.Status,
-			"capacity", obs.Capacity, "gpu_type", obs.GPUType)
+	logger := log.FromContext(ctx)
+	newCap, newType := r.Metrics.record(obs.Name, res.CapacityConflict, res.TypeConflict)
+	if newCap {
+		logger.Info("node capacity below allocated; keeping stored capacity", "node", obs.Name,
+			"reported_capacity", obs.Capacity, "conflict", "capacity")
+	}
+	if newType {
+		logger.Info("node gpu type label differs from stored gpu_type; keeping stored type", "node", obs.Name,
+			"label_gpu_type", obs.GPUType, "stored_gpu_type", res.StoredGPUType, "conflict", "gpu_type")
+	}
+	if res.Wrote {
+		logger.Info("node synced", "node", obs.Name, "status", obs.Status,
+			"capacity", obs.Capacity, "capacity_known", obs.CapacityKnown, "gpu_type", res.StoredGPUType)
 	}
 	return ctrl.Result{}, nil
 }
 
+func (r *NodeReconciler) markNotReady(ctx context.Context, name, why string) error {
+	r.Metrics.forget(name)
+	changed, err := r.Nodes.MarkNodeNotReady(ctx, name)
+	if err != nil {
+		return err
+	}
+	if changed {
+		log.FromContext(ctx).Info("node marked NOT_READY", "node", name, "reason", why)
+	}
+	return nil
+}
+
 // SetupWithManager registers the reconciler on mgr, watching only Nodes that
-// carry the GPU type label.
+// carry (or, for updates, carried) the GPU type label, so removing the label
+// still reaches Reconcile.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	workers := r.Workers
 	if workers <= 0 {
 		workers = DefaultNodeWorkers
 	}
-	isGPU := predicate.NewPredicateFuncs(func(o client.Object) bool {
-		_, ok := o.GetLabels()[LabelGPUType]
-		return ok
-	})
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Node{}, builder.WithPredicates(isGPU)).
+		For(&corev1.Node{}, builder.WithPredicates(gpuNodePredicate())).
 		Named("node").
 		WithOptions(crcontroller.Options{MaxConcurrentReconciles: workers}).
 		Complete(r)
+}
+
+// gpuNodePredicate passes events for GPU Nodes; an update passes if either
+// the old or the new object has the label, so label removal is seen.
+func gpuNodePredicate() predicate.Funcs {
+	p := predicate.NewPredicateFuncs(hasGPULabel)
+	p.UpdateFunc = func(e event.UpdateEvent) bool {
+		return hasGPULabel(e.ObjectOld) || hasGPULabel(e.ObjectNew)
+	}
+	return p
+}
+
+func hasGPULabel(o client.Object) bool {
+	if o == nil {
+		return false
+	}
+	_, ok := o.GetLabels()[LabelGPUType]
+	return ok
 }
 
 // observeNode maps a Node to its row. ok is false for non-GPU Nodes.
@@ -86,14 +133,17 @@ func observeNode(n *corev1.Node) (store.NodeObservation, bool) {
 	if !ok || gpuType == "" {
 		return store.NodeObservation{}, false
 	}
+	// No GPU resource reported (kubelet starting) is "unknown", not 0.
 	var capacity int
-	if q, ok := n.Status.Capacity[ResourceGPU]; ok {
+	q, known := n.Status.Capacity[ResourceGPU]
+	if known {
 		capacity = int(q.Value())
 	}
 	return store.NodeObservation{
 		Name:          n.Name,
 		GPUType:       gpuType,
 		Capacity:      capacity,
+		CapacityKnown: known,
 		FailureDomain: n.Labels[LabelZone],
 		Status:        nodeStatus(n),
 	}, true
