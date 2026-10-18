@@ -68,7 +68,8 @@ var errPodTerminating = errors.New("pod is terminating")
 
 // InstanceReconciler drives a GPUInstance through its lifecycle (ADR-0002
 // §Reconcile, by DB state). S2-7 implements SCHEDULED → PROVISIONING →
-// RUNNING; other states are left alone until S2-8 … S2-11.
+// RUNNING; S2-8 the delete path (TERMINATING → TERMINATED, terminal cleanup,
+// CR deleted by hand); failures and TTL follow in S2-9 … S2-11.
 type InstanceReconciler struct {
 	// Client reads from the Manager's cache and writes to the API server.
 	Client client.Client
@@ -153,6 +154,11 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 // reconcileInstance dispatches on the DB state (the DB always wins).
 func (r *InstanceReconciler) reconcileInstance(ctx context.Context, inst store.Instance) (ctrl.Result, error) {
+	// A CR deleted by hand moves a live row to TERMINATING first (S2-8).
+	inst, err := r.terminateIfCRDeleted(ctx, inst)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	switch inst.State {
 	case statemachine.Scheduled:
 		cr, err := r.ensureCR(ctx, inst)
@@ -185,8 +191,12 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, inst store.I
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, r.syncStatus(ctx, cr, inst)
+	case statemachine.Terminating:
+		return r.reconcileTerminating(ctx, inst) // S2-8 (instance_delete.go)
+	case statemachine.Terminated, statemachine.Failed:
+		return r.reconcileTerminal(ctx, inst) // S2-8 (instance_delete.go)
 	default:
-		// TERMINATING, TERMINATED, FAILED: S2-8 onward. PENDING: v2 queue.
+		// PENDING: v2 queue.
 		return ctrl.Result{}, nil
 	}
 }
@@ -227,7 +237,9 @@ func (r *InstanceReconciler) ensureCR(ctx context.Context, inst store.Instance) 
 	if err != nil {
 		return nil, fmt.Errorf("get GPUInstance %s: %w", key, err)
 	}
-	if !controllerutil.ContainsFinalizer(cr, gpuv1alpha1.FinalizerReleaseCapacity) {
+	// A CR being deleted cannot take new finalizers; terminateIfCRDeleted
+	// handles it (only a stale cache gets here).
+	if cr.DeletionTimestamp == nil && !controllerutil.ContainsFinalizer(cr, gpuv1alpha1.FinalizerReleaseCapacity) {
 		base := cr.DeepCopy()
 		controllerutil.AddFinalizer(cr, gpuv1alpha1.FinalizerReleaseCapacity)
 		if err := r.Client.Patch(ctx, cr, client.MergeFrom(base)); err != nil {
@@ -261,27 +273,24 @@ func newCR(namespace string, inst store.Instance) *gpuv1alpha1.GPUInstance {
 // exactly one Pod. An existing Pod that is being deleted is errPodTerminating.
 func (r *InstanceReconciler) ensurePod(ctx context.Context, cr *gpuv1alpha1.GPUInstance) error {
 	key := types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}
+	if cr.DeletionTimestamp != nil {
+		return fmt.Errorf("ensure Pod %s: %w", key, errCRDeleting)
+	}
 	var pod corev1.Pod
 	err := r.Client.Get(ctx, key, &pod)
 	if err == nil {
-		if pod.DeletionTimestamp != nil {
-			return fmt.Errorf("ensure Pod %s: %w", key, errPodTerminating)
-		}
-		return nil
+		return existingPodUsable(key, &pod, cr)
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Pod %s: %w", key, err)
 	}
 	err = r.Client.Create(ctx, BuildPod(cr, r.Pod))
 	if apierrors.IsAlreadyExists(err) {
-		// Our cache is behind; check the live Pod is not one being deleted.
+		// Our cache is behind; check the live Pod is ours and not being deleted.
 		if err := r.APIReader.Get(ctx, key, &pod); err != nil {
 			return fmt.Errorf("get Pod %s: %w", key, err)
 		}
-		if pod.DeletionTimestamp != nil {
-			return fmt.Errorf("ensure Pod %s: %w", key, errPodTerminating)
-		}
-		return nil
+		return existingPodUsable(key, &pod, cr)
 	}
 	if err != nil {
 		return fmt.Errorf("create Pod %s: %w", key, err)
@@ -290,7 +299,9 @@ func (r *InstanceReconciler) ensurePod(ctx context.Context, cr *gpuv1alpha1.GPUI
 }
 
 // podReady reports whether cr's Pod is in the cache with Ready=True and not
-// being deleted (Ready stays True during preStop; it must not count).
+// being deleted (Ready stays True during preStop; it must not count). A Pod
+// that does not belong to the instance (podBelongsTo, D42) is errPodNotOwned
+// (the key backs off, visibly).
 func (r *InstanceReconciler) podReady(ctx context.Context, cr *gpuv1alpha1.GPUInstance) (bool, error) {
 	key := types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}
 	var pod corev1.Pod
@@ -299,6 +310,11 @@ func (r *InstanceReconciler) podReady(ctx context.Context, cr *gpuv1alpha1.GPUIn
 			return false, nil
 		}
 		return false, fmt.Errorf("get Pod %s: %w", key, err)
+	}
+	// A Ready Pod that does not belong to the instance must never move it to
+	// RUNNING (S2-8, D42).
+	if !podBelongsTo(&pod, cr.Namespace, cr.Spec.InstanceID) {
+		return false, fmt.Errorf("pod %s: %w", key, errPodNotOwned)
 	}
 	return pod.DeletionTimestamp == nil && isPodReady(&pod), nil
 }

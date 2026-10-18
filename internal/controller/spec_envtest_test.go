@@ -108,13 +108,13 @@ func specTable() []specCase {
 		{name: "RUNNING/deleting: capacity held until Pod is gone", db: R, pod: podDeleting, podWant: podUnchanged},
 
 		// TERMINATING: delete Pod (NotFound ok); Pod confirmed gone → TERMINATED.
-		{name: "TERMINATING/absent: TERMINATED, CR removed", db: T, pod: podAbsent, pending: "S2-8",
+		{name: "TERMINATING/absent: TERMINATED, CR removed", db: T, pod: podAbsent,
 			want: D, events: []statemachine.State{D}, podWant: podGone, crGone: true},
-		{name: "TERMINATING/pending: delete Pod, TERMINATED", db: T, pod: podPending, pending: "S2-8",
+		{name: "TERMINATING/pending: delete Pod, TERMINATED", db: T, pod: podPending,
 			want: D, events: []statemachine.State{D}, podWant: podGone, crGone: true},
-		{name: "TERMINATING/ready: delete Pod, TERMINATED", db: T, pod: podReady, pending: "S2-8",
+		{name: "TERMINATING/ready: delete Pod, TERMINATED", db: T, pod: podReady,
 			want: D, events: []statemachine.State{D}, podWant: podGone, crGone: true},
-		{name: "TERMINATING/failed: delete Pod, TERMINATED", db: T, pod: podInitFailed, pending: "S2-8",
+		{name: "TERMINATING/failed: delete Pod, TERMINATED", db: T, pod: podInitFailed,
 			want: D, events: []statemachine.State{D}, podWant: podGone, crGone: true},
 		{name: "TERMINATING/deleting: no release while Pod exists", db: T, pod: podDeleting, podWant: podUnchanged},
 
@@ -130,14 +130,14 @@ func specTable() []specCase {
 		for _, ps := range []podState{podAbsent, podPending, podReady, podInitFailed} {
 			cases = append(cases, specCase{
 				name: fmt.Sprintf("%s/%s: Pod and CR removed, row untouched", term, ps),
-				db:   term, reason: reason, pod: ps, pending: "S2-8", podWant: podGone, crGone: true,
+				db:   term, reason: reason, pod: ps, podWant: podGone, crGone: true,
 			})
 		}
 		// ADR does not order "Pod gone" vs "remove finalizer" for a Pod stuck
 		// deleting; only check the row is untouched.
 		cases = append(cases, specCase{
 			name: fmt.Sprintf("%s/deleting: row untouched", term),
-			db:   term, reason: reason, pod: podDeleting, pending: "S2-8", podWant: podUnchanged,
+			db:   term, reason: reason, pod: podDeleting, podWant: podUnchanged,
 		})
 	}
 	// SCHEDULED/PROVISIONING/RUNNING with expires_at <= db_now → TERMINATING.
@@ -698,7 +698,6 @@ func TestSpecDeleteRacesRunning(t *testing.T) {
 // TERMINATED; the finalizer is removed only once the row is terminal
 // (ADR-0002 §Reconcile, "A CR deleted by hand"; invariant 5).
 func TestSpecCRDeletedByHand(t *testing.T) {
-	t.Skip("pending S2-8")
 	e := newSpecEnv(t)
 	f := e.seedRow(t, statemachine.Running, "", "")
 	cr := e.createCR(t, f)

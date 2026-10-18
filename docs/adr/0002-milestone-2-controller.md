@@ -151,6 +151,12 @@ This is what happens between "a Pod became Ready" and our `Reconcile` running.
 
 The Pod has the same name, labels `app=gpu-instance` and
 `gpu.example.com/instance-id`, and an `ownerReference` to the CR.
+Ownership is decided per instance, not per CR UID (Discussion D42): a Pod
+belongs to instance `id` iff it is in the instance namespace, its controller
+ownerReference is a `gpu.example.com` GPUInstance named `K8sName(id)`, and it
+carries the instance-id label `id`. One helper (`podBelongsTo`) is used for
+Pod create, Ready, pod-lost and delete. A Pod that does not belong is never
+deleted by us.
 
 ### Data model changes (M2a)
 
@@ -267,6 +273,9 @@ consequences, plus one new detail this ADR had to choose.
 | Controller crashes mid-step (after Pod create, before → PROVISIONING) | DB says SCHEDULED, Pod exists | On restart: LIST, cache sync, resync enqueues all non-terminal ids; create Pod → `AlreadyExists`; transition proceeds |
 | Controller crashes after DB → TERMINATED, before CR delete | CR with finalizer lingers | Next reconcile sees terminal row → deletes CR, removes finalizer |
 | Controller starts with an empty cache | Would see "no Pods" everywhere | WaitForCacheSync before workers start; live read before declaring a Pod missing |
+| Someone hand-edits a running Pod to drop our label or owner (D42) | Pod counts as foreign: instance → FAILED `pod_lost` (or TERMINATED), capacity released while that Pod may still run | Pod is never deleted by us (logged, `gpucp_controller_orphans_total{kind="pod"}`). The DB never over-allocates; a new Pod placed on those GPUs is rejected by the kubelet's extended-resource check and fails `boot_failed`. Requires write access to Pods in the namespace |
+| Pod left from an older CR with the same name (D42) | Counts as ours; may be garbage-collected by Kubernetes because its owner UID is gone | Delete path deletes it and waits before releasing. If GC removes it first: RUNNING → FAILED `pod_lost`, PROVISIONING waits for the S2-10 timeout. Self-healing |
+| Pod ends Succeeded or Failed while RUNNING | GPU machine gone | Delete Pod, then FAILED `pod_lost` once a live read shows it gone (D43) |
 | Controller down for minutes | No progress; instances stay in their state; timeouts not enforced | Deadlines are on DB time, so on restart overdue instances fail at once; API keeps serving |
 | Stale cache (Pod Ready not yet seen) | One reconcile does nothing | The Pod event re-enqueues the key when it lands |
 | Poller misses a row (long tx, clock skew) | Delay | 5s overlap on DB time; 30s full resync; CR/Pod events |

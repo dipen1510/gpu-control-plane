@@ -703,6 +703,8 @@ numbered M2-1 … M2-16 in the meeting). Same format as above. ADR-0002
 | D39 | ADR-0002 Q2 | Node sync timing | Basic node sync moves **into M2a** (READY / NOT_READY / CORDONED); probation, quarantine, flapping stay in M2b |
 | D40 | S2-5 review | Queue key → instance id | Stored generated column `instances.k8s_name = replace(id,'_','-')`, UNIQUE + indexed; Reconcile looks rows up by it |
 | D41 | S2-19 flake | Node with never-known capacity | Stays NOT_READY until capacity is reported, whatever the event order (S2-20) |
+| D42 | S2-8/S2-9 review | Which Pods are ours | Instance-scoped: controller GPUInstance named `K8sName(id)` + instance-id label, no UID compare; one helper everywhere; foreign Pods never deleted |
+| D43 | S2-9 | RUNNING Pod outcomes | Succeeded counts as lost like Failed; a foreign Pod in RUNNING → FAILED `pod_lost`, Pod kept, counted as orphan |
 
 ---
 
@@ -1206,4 +1208,34 @@ B: drop the special case; status simply follows Ready (READY/0 for a few seconds
 the event history. With A, READY always means "can take work", the READY node metric is honest, and
 `status_changed_at` is not stamped before the node is usable (which the M2b probation clock relies on).
 Safety was never at risk: placement needs `allocated + n <= capacity`, so nothing fits into 0.
+
+## D42 — Which Pods belong to an instance (S2-8/S2-9 review)
+
+**Question.** S2-9 judged ownership by the CR's UID; S2-8's delete path, when no CR existed, judged it
+by name and label. The verifier found a Pod that one rule called foreign and the other called ours, so
+it was first left alone and then deleted.
+
+**Options.** A: compare the owner UID (per-CR). B: instance-scoped — controller is a `gpu.example.com`
+GPUInstance named `K8sName(id)`, Pod carries the instance-id label `id`, in the instance namespace; no
+UID compare.
+
+**Decision: B** (tech lead, 2026-10-18). One helper, `podBelongsTo`, used by Pod create, Ready,
+pod-lost and the delete path. A Pod that does not belong is never deleted.
+
+**Why.** Names are unique per instance (D37), so any CR with that name was made for this instance and
+its Pod is this instance's machine. Under A, capacity could be released while a Pod made for this
+instance (from an older CR) still ran — a risk to invariants 1 and 5. **Costs, accepted:** anyone who
+can write Pods in the namespace can make a Pod look like ours or not ours by editing label/owner; a
+Pod from an older CR may be removed by Kubernetes garbage collection, after which the instance fails
+`pod_lost` (self-healing). Both are in ADR-0002 §Failure modes.
+
+## D43 — Pod outcomes while RUNNING (S2-9)
+
+**Decision** (tech lead, 2026-10-18):
+- A Pod that ends **Succeeded** counts as lost, like Failed: the main container is `sleep infinity`,
+  so any exit means the machine is gone. The controller deletes it, then writes FAILED `pod_lost` only
+  once a live read shows it gone (capacity is never released while a Pod exists).
+- A Pod with our name that is **not ours** (D42) → after a live read, FAILED `pod_lost`; the Pod is
+  never deleted; one log line and `gpucp_controller_orphans_total{kind="pod"}` +1, counted right after
+  the commit so retries and status-patch failures can't double- or zero-count it.
 
