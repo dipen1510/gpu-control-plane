@@ -701,6 +701,7 @@ numbered M2-1 … M2-16 in the meeting). Same format as above. ADR-0002
 | D37 | ADR-0002 Q1 | Kubernetes names | `inst_x` → `inst-x` for CR and Pod names; original ID in a label |
 | D38 | ADR-0002 Q3 | Terminal CRs | Controller deletes the CR once the row is TERMINATED or FAILED; Postgres keeps history |
 | D39 | ADR-0002 Q2 | Node sync timing | Basic node sync moves **into M2a** (READY / NOT_READY / CORDONED); probation, quarantine, flapping stay in M2b |
+| D40 | S2-5 review | Queue key → instance id | Stored generated column `instances.k8s_name = replace(id,'_','-')`, UNIQUE + indexed; Reconcile looks rows up by it |
 
 ---
 
@@ -1165,3 +1166,28 @@ inventory, as D15 always intended, and M2b only adds health policy on top.
 **Protects:** invariant 1 (placement only on READY nodes, guarded in the
 reserve's `WHERE`; capacity never set below `allocated`), invariant 7 (sync
 never writes `allocated`).
+
+## D40 — Finding an instance from its queue key (S2-5 review)
+
+**Question.** The poller and the informers queue `{gpucp, K8sName(id)}`
+(D37), so a worker gets `inst-x`, not the DB id `inst_x`. When the CR exists
+the id is on its label, but a brand-new instance found by the poller has no
+CR yet. How does Reconcile find its row? D37 says the mapping is never
+reversed, because two ids could map to one name.
+
+**Options.**
+- **A. Stored generated column** `k8s_name text GENERATED ALWAYS AS
+  (replace(id,'_','-')) STORED UNIQUE`; lookup `WHERE k8s_name = $1`.
+- B. Expression lookup `WHERE replace(id,'_','-') = $1` with an expression
+  index. No new column, but two colliding ids are not caught, so a lookup
+  could match two rows.
+- C. Change the id format to be Kubernetes-safe (`inst-…`). No mapping at
+  all, but it changes the M1 API and tests and reverses D37.
+
+**Decision: A** (tech lead, 2026-10-17). Added as migration 0008 in S2-7.
+
+**Why.** The UNIQUE constraint makes a name collision impossible at insert
+time, so the lookup can never be ambiguous. It is indexed, so it is one fast
+query, and Postgres computes the column itself, so no code can write a wrong
+value. Cost: one more column and migration.
+
