@@ -63,12 +63,23 @@ type Options struct {
 	// NodeSweepInterval is the period of the node sweep (S2-19). Zero means
 	// DefaultNodeSweepInterval.
 	NodeSweepInterval time.Duration
+
+	// Instances is what the InstanceReconciler reads rows from and commits
+	// transitions through (S2-7). Nil leaves Reconcile a no-op (tests that
+	// run no Postgres).
+	Instances InstanceStore
+	// Pod shapes the fake GPU Pod. A zero value (empty Image) means
+	// DefaultPodConfig; callers validate it at startup.
+	Pod PodConfig
 }
 
 // withDefaults fills zero sizing fields with the Default* constants.
 func (o Options) withDefaults() Options {
 	if o.InstanceNamespace == "" {
 		o.InstanceNamespace = DefaultInstanceNamespace
+	}
+	if o.Pod == (PodConfig{}) {
+		o.Pod = DefaultPodConfig()
 	}
 	if o.InstanceWorkers <= 0 {
 		o.InstanceWorkers = DefaultInstanceWorkers
@@ -148,7 +159,11 @@ func NewManager(cfg *rest.Config, opts Options) (ctrl.Manager, error) {
 			return nil, fmt.Errorf("add db poller: %w", err)
 		}
 	}
-	if err := (&InstanceReconciler{Workers: opts.InstanceWorkers, Metrics: m, PollerEvents: pollEvents, Namespace: opts.InstanceNamespace}).SetupWithManager(mgr); err != nil {
+	ir := &InstanceReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Store: opts.Instances, Pod: opts.Pod,
+		Workers: opts.InstanceWorkers, Metrics: m, PollerEvents: pollEvents, Namespace: opts.InstanceNamespace,
+	}
+	if err := ir.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup instance reconciler: %w", err)
 	}
 	if opts.Nodes != nil {

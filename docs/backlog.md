@@ -515,7 +515,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 | S2-4 | 2 | kubebuilder scaffold, GPUInstance CRD, RBAC, `cmd/controller` | implementer | — | Done |
 | S2-5 | 2 | DB poller + `updated_at` index | implementer | S2-4 | Done |
 | S2-6 | 1 | Fake GPU Pod spec builder | implementer | S2-4 | Done |
-| S2-7 | 2 | InstanceReconciler happy path: SCHEDULED → PROVISIONING → RUNNING | implementer | S2-5, S2-6 | Proposed |
+| S2-7 | 2 | InstanceReconciler happy path: SCHEDULED → PROVISIONING → RUNNING | implementer | S2-5, S2-6 | Done |
 | S2-8 | 2 | Delete path: TERMINATING → TERMINATED with finalizer | implementer | S2-7 | Proposed |
 | S2-9 | 1 | RUNNING → FAILED edge and `pod_lost` | implementer | S2-7 | Proposed |
 | S2-10 | 2 | Boot failure and provisioning timeout | implementer | S2-8 | Proposed |

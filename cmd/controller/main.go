@@ -42,7 +42,18 @@ func run() error {
 	flag.DurationVar(&opts.PollInterval, "poll-interval", poller.DefaultInterval, "DB poller: how often to fetch recently updated instance ids")
 	flag.StringVar(&opts.InstanceNamespace, "instance-namespace", controller.DefaultInstanceNamespace, "namespace of GPUInstance CRs (poller ids are keyed into it)")
 	flag.DurationVar(&opts.PollResyncInterval, "poll-resync-interval", poller.DefaultResyncInterval, "DB poller: how often to enqueue every non-terminal instance id")
+	pod := controller.DefaultPodConfig()
+	flag.StringVar(&pod.Image, "pod-image", pod.Image, "image of the fake GPU Pod (busybox)")
+	flag.IntVar(&pod.BootSecondsMin, "pod-boot-seconds-min", pod.BootSecondsMin, "fake GPU Pod: minimum boot sleep in seconds")
+	flag.IntVar(&pod.BootSecondsMax, "pod-boot-seconds-max", pod.BootSecondsMax, "fake GPU Pod: maximum boot sleep in seconds")
+	flag.Float64Var(&pod.BootFailRate, "pod-boot-fail-rate", pod.BootFailRate, "fake GPU Pod: probability in [0,1] that boot fails")
+	flag.IntVar(&pod.ShutdownSeconds, "pod-shutdown-seconds", pod.ShutdownSeconds, "fake GPU Pod: preStop sleep in seconds")
 	flag.Parse()
+	// Fail fast on a Pod config BuildPod cannot turn into a sane Pod.
+	if err := pod.Validate(); err != nil {
+		return fmt.Errorf("pod flags: %w", err)
+	}
+	opts.Pod = pod
 	opts.DBMaxConns = int32(min(max(dbMaxConns, 0), math.MaxInt32))
 	opts.KubeQPS = float32(kubeQPS)
 
@@ -71,7 +82,9 @@ func run() error {
 		return fmt.Errorf("open database pool: %w", err)
 	}
 	defer pool.Close()
-	opts.Nodes = store.New(pool, nil)
+	st := store.New(pool, nil)
+	opts.Nodes = st
+	opts.Instances = st
 	opts.PollDB = pool
 
 	mgr, err := controller.NewManager(cfg, opts)

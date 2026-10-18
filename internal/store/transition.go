@@ -155,6 +155,22 @@ func (s *Store) getByID(ctx context.Context, id string) (Instance, error) {
 	return inst, nil
 }
 
+// GetByK8sName reads the instance whose Kubernetes object name is name
+// (the generated, UNIQUE column instances.k8s_name; D40). It is how the
+// controller resolves its queue key {namespace, K8sName(id)} to a row, even
+// before any CR exists. Like Transition it is a system read, not scoped to a
+// tenant. ErrNotFound if no row has that name.
+func (s *Store) GetByK8sName(ctx context.Context, name string) (Instance, error) {
+	inst, err := scanInstance(s.db.QueryRow(ctx, getInstanceByK8sNameSQL, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Instance{}, fmt.Errorf("get instance by k8s name %s: %w", name, ErrNotFound)
+	}
+	if err != nil {
+		return Instance{}, fmt.Errorf("get instance by k8s name %s: %w", name, err)
+	}
+	return inst, nil
+}
+
 // scanInstance scans the column list instanceColumns.
 func scanInstance(row pgx.Row) (Instance, error) {
 	var inst Instance
@@ -234,3 +250,5 @@ SET state = $2, resource_version = resource_version + 1,
     failure_reason = COALESCE($3, failure_reason), updated_at = now()
 WHERE id = $1 AND state = $4 AND resource_version = $5
 RETURNING ` + instanceColumns
+
+const getInstanceByK8sNameSQL = `SELECT ` + instanceColumns + ` FROM instances WHERE k8s_name = $1`

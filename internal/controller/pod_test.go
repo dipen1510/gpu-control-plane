@@ -147,3 +147,52 @@ func TestBootScriptExitCode(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildPodSecurityContext: both containers run hardened (S2-7): non-root
+// UID 65534, no privilege escalation, every capability dropped, read-only
+// root filesystem. Each container gets its own SecurityContext value.
+func TestBuildPodSecurityContext(t *testing.T) {
+	pod := BuildPod(testInstance(), DefaultPodConfig())
+	containers := append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
+	if len(containers) != 2 {
+		t.Fatalf("containers = %d, want 2", len(containers))
+	}
+	for _, c := range containers {
+		t.Run(c.Name, func(t *testing.T) {
+			sc := c.SecurityContext
+			if sc == nil {
+				t.Fatal("SecurityContext is nil")
+			}
+			if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+				t.Error("runAsNonRoot is not true")
+			}
+			if sc.RunAsUser == nil || *sc.RunAsUser != 65534 {
+				t.Errorf("runAsUser = %v, want 65534", sc.RunAsUser)
+			}
+			if sc.RunAsGroup == nil || *sc.RunAsGroup != 65534 {
+				t.Errorf("runAsGroup = %v, want 65534", sc.RunAsGroup)
+			}
+			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+				t.Error("allowPrivilegeEscalation is not false")
+			}
+			if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+				t.Error("readOnlyRootFilesystem is not true")
+			}
+			if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) != 0 {
+				t.Errorf("capabilities = %+v, want drop [ALL], add none", sc.Capabilities)
+			}
+			if sc.Privileged != nil && *sc.Privileged {
+				t.Error("privileged is true")
+			}
+		})
+	}
+	if psc := pod.Spec.SecurityContext; psc == nil || psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("pod securityContext = %+v, want seccompProfile RuntimeDefault", psc)
+	}
+	if a := pod.Spec.AutomountServiceAccountToken; a == nil || *a {
+		t.Errorf("automountServiceAccountToken = %v, want false", a)
+	}
+	if pod.Spec.InitContainers[0].SecurityContext == pod.Spec.Containers[0].SecurityContext {
+		t.Error("containers share one SecurityContext pointer")
+	}
+}

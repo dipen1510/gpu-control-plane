@@ -26,7 +26,27 @@ const (
 	// terminationGraceSlackSeconds keeps the grace period strictly above the
 	// preStop sleep so the kubelet never kills the hook mid-sleep.
 	terminationGraceSlackSeconds = 10
+
+	// podUID is the user and group both containers run as: "nobody". busybox
+	// sh, awk and sleep need no privileges and write nothing to disk, so the
+	// root filesystem is read-only too.
+	podUID int64 = 65534
 )
+
+// hardenedSecurityContext is applied to every container of the fake GPU Pod:
+// non-root, no privilege escalation, no Linux capabilities, read-only root
+// filesystem. A new pointer set per call so Pods never share mutable state.
+func hardenedSecurityContext() *corev1.SecurityContext {
+	uid, nonRoot, noEscalation, readOnly := podUID, true, false, true
+	return &corev1.SecurityContext{
+		RunAsUser:                &uid,
+		RunAsGroup:               &uid,
+		RunAsNonRoot:             &nonRoot,
+		AllowPrivilegeEscalation: &noEscalation,
+		ReadOnlyRootFilesystem:   &readOnly,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+}
 
 // PodConfig shapes the fake GPU Pod (D35). All delays happen inside the Pod;
 // our Go code never sleeps.
@@ -87,6 +107,7 @@ func BuildPod(inst *gpuv1alpha1.GPUInstance, cfg PodConfig) *corev1.Pod {
 	grace := int64(cfg.ShutdownSeconds + terminationGraceSlackSeconds)
 	controller := true
 	blockOwnerDeletion := true
+	automountToken := false // the fake GPU Pod never talks to the API server
 
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
@@ -110,10 +131,15 @@ func BuildPod(inst *gpuv1alpha1.GPUInstance, cfg PodConfig) *corev1.Pod {
 			NodeName:                      inst.Spec.NodeName,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			TerminationGracePeriodSeconds: &grace,
+			AutomountServiceAccountToken:  &automountToken,
+			SecurityContext: &corev1.PodSecurityContext{
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
 			InitContainers: []corev1.Container{{
-				Name:    bootContainerName,
-				Image:   cfg.Image,
-				Command: []string{"sh", "-c", bootScript},
+				Name:            bootContainerName,
+				Image:           cfg.Image,
+				Command:         []string{"sh", "-c", bootScript},
+				SecurityContext: hardenedSecurityContext(),
 				Env: []corev1.EnvVar{
 					{Name: "BOOT_MIN", Value: strconv.Itoa(cfg.BootSecondsMin)},
 					{Name: "BOOT_MAX", Value: strconv.Itoa(cfg.BootSecondsMax)},
@@ -121,10 +147,11 @@ func BuildPod(inst *gpuv1alpha1.GPUInstance, cfg PodConfig) *corev1.Pod {
 				},
 			}},
 			Containers: []corev1.Container{{
-				Name:      mainContainerName,
-				Image:     cfg.Image,
-				Command:   []string{"sleep", "infinity"},
-				Resources: corev1.ResourceRequirements{Requests: res, Limits: res.DeepCopy()},
+				Name:            mainContainerName,
+				Image:           cfg.Image,
+				Command:         []string{"sleep", "infinity"},
+				SecurityContext: hardenedSecurityContext(),
+				Resources:       corev1.ResourceRequirements{Requests: res, Limits: res.DeepCopy()},
 				Lifecycle: &corev1.Lifecycle{
 					PreStop: &corev1.LifecycleHandler{
 						Exec: &corev1.ExecAction{

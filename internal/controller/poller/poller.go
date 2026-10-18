@@ -90,10 +90,12 @@ func New(db DB, out chan<- Event, cfg Config, reg prometheus.Registerer, log *sl
 		Help: "DB poller queries that failed (retried next tick).",
 	})
 	if reg != nil {
-		for _, c := range []prometheus.Collector{ids, errs} {
-			if err := reg.Register(c); err != nil {
-				return nil, fmt.Errorf("register poller metrics: %w", err)
-			}
+		var err error
+		if ids, err = registerOrReuse(reg, ids); err != nil {
+			return nil, err
+		}
+		if errs, err = registerOrReuse(reg, errs); err != nil {
+			return nil, err
 		}
 	}
 	return &Poller{
@@ -102,6 +104,25 @@ func New(db DB, out chan<- Event, cfg Config, reg prometheus.Registerer, log *sl
 		idsResync:  ids.WithLabelValues("resync"),
 		errs:       errs,
 	}, nil
+}
+
+// registerOrReuse registers c on reg. If an identical collector is already
+// registered (a second Manager in one process, e.g. tests, since
+// controller-runtime's metrics.Registry is process-wide), it returns that
+// one, the same pattern as controller.register.
+func registerOrReuse[C prometheus.Collector](reg prometheus.Registerer, c C) (C, error) {
+	err := reg.Register(c)
+	if err == nil {
+		return c, nil
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(C); ok {
+			return existing, nil
+		}
+	}
+	var zero C
+	return zero, fmt.Errorf("register poller metrics: %w", err)
 }
 
 // Start resyncs once, then polls until ctx is cancelled. It returns nil on

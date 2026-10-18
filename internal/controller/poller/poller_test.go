@@ -165,3 +165,22 @@ func TestSendStopsOnCancel(t *testing.T) {
 		t.Fatalf("Resync = %d, %v; want 0, errStopped", n, err)
 	}
 }
+
+// TestNewTwiceOnOneRegistryReusesCollectors: a second poller on the same
+// registry (a second Manager in one process) must not fail, and both share
+// the registered counters.
+func TestNewTwiceOnOneRegistryReusesCollectors(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	p1, err := New(&fakeDB{}, make(chan Event, 1), Config{}, reg, nil)
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	p2, err := New(&fakeDB{}, make(chan Event, 1), Config{}, reg, nil)
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	p2.errs.Inc()
+	if got := testutil.ToFloat64(p1.errs); got != 1 {
+		t.Errorf("first poller's errors counter = %v, want 1 (shared collector)", got)
+	}
+}
