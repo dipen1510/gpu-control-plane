@@ -523,7 +523,7 @@ Out of scope: CLAUDE.md updates (state diagram RUNNING → FAILED, M1 driver not
 | S2-12 | 2 | Remove the M1 driver; API DELETE stops at TERMINATING | implementer | S2-8 | Proposed |
 | S2-13 | 1 | Workqueue tuning, sizing flags and controller metrics | implementer | S2-7 | Done |
 | S2-14 | 2 | Helm chart (apiserver + controller), `make deploy`, smoke test | deployer | S2-3, S2-12, S2-18 | Proposed |
-| S2-15 | 2 | Reconciler spec tests (envtest) from ADR-0002 | test-engineer | S2-4 | Proposed |
+| S2-15 | 2 | Reconciler spec tests (envtest) from ADR-0002 | test-engineer | S2-4 | Done |
 | S2-16 | 2 | End-to-end lifecycle tests on kind | test-engineer | S2-14, S2-19 | Proposed |
 | S2-17 | 2 | `nodes.status` replaces `schedulable`; Place only on READY | implementer | — | Done |
 | S2-18 | 2 | NodeReconciler: upsert GPU Nodes with READY / NOT_READY / CORDONED | implementer | S2-4, S2-17 | Done |
