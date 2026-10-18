@@ -167,8 +167,24 @@ func TestNodeCapacityDisappearsKeepsStored(t *testing.T) {
 	if r.capacity != 8 {
 		t.Fatalf("capacity = %d after resource disappeared, want 8", r.capacity)
 	}
-	// A brand-new Node with no capacity yet is inserted NOT_READY / 0.
-	e.createNode(t, "gpu-new", "A100", "")
+	// A brand-new Node that is Ready but reports no capacity yet is inserted
+	// NOT_READY / 0. The first event the reconciler sees must already carry
+	// Ready=True, or the insert is trivially NOT_READY (no conditions) and a
+	// later update takes the conflict branch, which keeps capacity 0 and
+	// syncs status READY. So: create unlabeled (filtered out), set status,
+	// then add the label; that label update is the first event that passes.
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-new"}}
+	if err := e.c.Create(t.Context(), n); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	e.updateStatus(t, "gpu-new", corev1.ConditionTrue, "")
+	if err := e.c.Get(t.Context(), types.NamespacedName{Name: "gpu-new"}, n); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	n.Labels = map[string]string{LabelGPUType: "A100"}
+	if err := e.c.Update(t.Context(), n); err != nil {
+		t.Fatalf("label node: %v", err)
+	}
 	e.waitRow(t, "gpu-new", func(r envRow) bool { return r.status == store.NodeNotReady && r.capacity == 0 })
 }
 
